@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eummy"
+version = "1.0.0"
+authors = [
+  { name="Mischa Schirmer", email="schirmer@mpia.de" },
+]
+description = "Create color images from Euclid MER stacks"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "GPL-3.0-or-later"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "numpy",
+    "astropy",
+    "opencv-python",
+    "tifffile",
+    "scikit-image",
+    "scipy",
+    "matplotlib",
+    "numexpr",
+    "psutil",
+]
+
+[project.scripts]
+eummy = "eummy.eummy:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
