@@ -17,8 +17,6 @@ Note: This will automatically install required dependencies including numpy, ast
 
 **eummy** is designed to be used as a command-line tool. After installation, the eummy command will be available in your terminal.
 
-### Basic Usage
-
 If your FITS files follow the standard Euclid MER naming convention, simply provide the path to the directory containing the 4 stacked images (1 VIS, 3 NISP):
 
 ```bash
