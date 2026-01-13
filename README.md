@@ -6,7 +6,7 @@ For more details about the Euclid space telescope visit <https://euclid-ec.org>.
 
 ## Installation
 
-You can install Eummy directly from PyPI:
+You can install **eummy** directly from PyPI:
 
 ```bash
 pip install eummy
@@ -31,4 +31,3 @@ This is sufficient to create a good color image for many purposes. To fine-tune 
 eummy --help
 ```
 for options.
-
