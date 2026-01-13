@@ -31,6 +31,11 @@ dependencies = [
     "psutil",
 ]
 
+[project.urls]
+Homepage = "https://github.com/schirmermischa/eummy"
+Repository = "https://github.com/schirmermischa/eummy"
+Issues = "https://github.com/schirmermischa/eummy/issues"
+
 [project.scripts]
 eummy = "eummy.eummy:main"
 

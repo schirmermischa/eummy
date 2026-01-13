@@ -6,11 +6,12 @@ For more details about the Euclid space telescope visit <https://euclid-ec.org>.
 
 ## Installation
 
-You can install **eummy** directly from PyPI:
+You can install **eummy** directly from PyPI using pip, pip3, or pipx:
 
 ```bash
-pip install eummy
+pipx install eummy
 ```
+
 Note: This will automatically install required dependencies including numpy, astropy, opencv-python, tifffile, scikit-image, scipy, and numexpr.
 
 ## Usage
