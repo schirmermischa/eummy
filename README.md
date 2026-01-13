@@ -1,6 +1,8 @@
 # eummy: A tool to create color images from Euclid MER stacks
 
-**eummy** is a Python tool designed to create high-quality color images from **Euclid MER** stacked images per tile. It processes FITS images from VIS and NISP instruments to produce visually optimized color composites.
+**eummy** is a Python tool designed to create high-quality color images from Euclid space telescope data, more specifically the **Euclid MER** stacked FITS images per tile.
+
+For more details about the Euclid space telescope visit <https://euclid-ec.org>.
 
 ## Installation
 
