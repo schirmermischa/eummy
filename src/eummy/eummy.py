@@ -24,6 +24,7 @@ from scipy.interpolate import InterpolatedUnivariateSpline
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 import numexpr as ne
+from importlib.metadata import version  # to pull the version number from pyproject.toml
 
 # Custom formatter combining RawTextHelpFormatter and ArgumentDefaultsHelpFormatter
 class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -408,6 +409,12 @@ def colorise_L(B, G, R, L, wcs, args, parser):
 
 # Main function
 def main():
+    # Grab the version number from the PyPI installation
+    current_version = version("eummy") 
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--version', action='version', version=f'%(prog)s {current_version}')
+
     args, parser = parse_arguments()
     B,G,R,L,wcs = rescale_and_blend(args)
     asinh_scale(B,G,R,L,args)
