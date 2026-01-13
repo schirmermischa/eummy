@@ -54,10 +54,19 @@ def str2bool(val):
 
 # Command-line arguments
 def parse_arguments():
+# Try to get version, fallback to 'unknown' if not installed yet
+    try:
+        current_version = version("eummy")
+    except PackageNotFoundError:
+        current_version = "dev"
+
     parser = argparse.ArgumentParser(
         description="Creates a colour image from Euclid MER stacks.\nRunning \"eummy.py --path /path/to/MERstacks/\" is usually sufficient.\nYou can fine-tune the result with additional command-line arguments.",
         formatter_class=CustomHelpFormatter
     )
+    
+    # Add the version flag
+    parser.add_argument('--version', action='version', version=f'%(prog)s {current_version}')
 
     parser.add_argument("--path", help="Absolute or relative path to MER stacks")
     parser.add_argument("--images", nargs=4, help="Input FITS files for bands: I Y J H (in this order), if not following the MER naming convention.")
@@ -409,13 +418,9 @@ def colorise_L(B, G, R, L, wcs, args, parser):
 
 # Main function
 def main():
-    # Grab the version number from the PyPI installation
-    current_version = version("eummy") 
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--version', action='version', version=f'%(prog)s {current_version}')
-
+    # Keep main simple; let the helper function handle the parser
     args, parser = parse_arguments()
+    
     B,G,R,L,wcs = rescale_and_blend(args)
     asinh_scale(B,G,R,L,args)
     normalise_floats(B,G,R,L,args)
