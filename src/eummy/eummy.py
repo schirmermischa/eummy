@@ -61,21 +61,21 @@ def parse_arguments():
         current_version = "dev"
 
     parser = argparse.ArgumentParser(
-        description="Creates a colour image from Euclid MER stacks.\nRunning \"eummy.py --path /path/to/MERstacks/\" is usually sufficient.\nYou can fine-tune the result with additional command-line arguments.",
+        description="Creates a colour image from Euclid MER stacks.\nRunning \"eummy \" in the directory with your images is usually sufficient.\nYou can fine-tune the result with additional command-line arguments.",
         formatter_class=CustomHelpFormatter
     )
     
     # Add the version flag
     parser.add_argument('--version', action='version', version=f'%(prog)s {current_version}')
 
-    parser.add_argument("--path", help="Absolute or relative path to MER stacks")
+    parser.add_argument("--path", default=os.getcwd(), help="Absolute or relative path to MER stacks")
     parser.add_argument("--images", nargs=4, help="Input FITS files for bands: I Y J H (in this order), if not following the MER naming convention.")
 
     parser.add_argument("--blackwhite", nargs=2, type=float, default=[-2, 10000],
                         help="Min/max thresholds in linear images (J-band reference)")
     parser.add_argument("--pivot", type=float, default=0.15, help="Fraction of max value used as pivot for compression")
     parser.add_argument("--strength", default="single", help="Use single or double asinh() compression")
-    parser.add_argument("--curve", type=float, default=1.0, help="Additional contrast curve (0: off, 1: strong)")
+    parser.add_argument("--contrast", type=float, default=None, help="Additional contrast curve (0: off, 1.0: EWS, 1.3: EDS")
 
     parser.add_argument("--scales", nargs=4, type=float, default=[0.00234, 0.65, 1.00, 1.14],
                         help="Scaling factors for bands I, Y, J, H")
@@ -93,15 +93,11 @@ def parse_arguments():
     parser.add_argument("--output", default="TILE[id].tiff", help="Output file name")
     parser.add_argument("--nthreads", type=int, default=os.cpu_count() // 2, help="Number of threads to use for parallel operations")
 
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
-
     args = parser.parse_args()
     args.UM = parse_um(args.UM)
     return args, parser
 
-# Curve adjustment
+# Contrast adjustment
 _curve_data = np.array([
     [0.0000, 0.0000],[0.0111, 0.0282],[0.0264, 0.0672],[0.0438, 0.1089],
     [0.0556, 0.1331],[0.0771, 0.1761],[0.0944, 0.2083],[0.1139, 0.2433],
@@ -113,12 +109,21 @@ _curve_data = np.array([
     [0.9410, 0.9825],[1.0000, 1.0000]
 ])
 
-def curve_adjustment(L, args):
-    if args.curve == 0:
+def contrast_adjustment(L, args):
+    if args.contrast == 0:
         return
-    print(f"Enhancing contrast by {args.curve}")
+    
+    height, width = L.shape
+    # EDS
+    if args.contrast is None:
+        if height == 10200 and width == 10200:
+            args.contrast = 1.6
+        else:
+            args.contrast = 1.0
+    
+    print(f"Enhancing contrast by {args.contrast}")
     x = _curve_data[:, 0]
-    y = args.curve * (_curve_data[:, 1] - x) + x
+    y = args.contrast * (_curve_data[:, 1] - x) + x
     spline = InterpolatedUnivariateSpline(x, y)
 
     L_flat = L.ravel()
@@ -142,14 +147,15 @@ def extract_tileID(filename):
         return "TILE.tiff"
 
 # Find images
-def find_images_in_directory(path):
+def find_images_in_directory(path, parser):
     vis_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-VIS*.fits"))
     nir_y_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-NIR-Y*.fits"))
     nir_j_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-NIR-J*.fits"))
     nir_h_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-NIR-H*.fits"))
 
     if len(vis_images) != 1 or len(nir_y_images) != 1 or len(nir_j_images) != 1 or len(nir_h_images) != 1:
-        print(f"Error: Expected exactly one image per band in {path}.")
+        print(f"Error: Expected exactly one image per band in {path}.\n")
+        parser.print_help()
         sys.exit(1)
 
     tileID = extract_tileID(vis_images[0])
@@ -344,7 +350,7 @@ def blend_L(args, i_data, h_data):
     return i_data
 
 # Rescale and blend
-def rescale_and_blend(args):
+def rescale_and_blend(args, parser):
     if not os.path.isdir(args.path):
         print(f"Error: Directory '{args.path}' does not exist.")
         sys.exit(1)
@@ -353,7 +359,7 @@ def rescale_and_blend(args):
         i_band, y_band, j_band, h_band = args.images
         tileID = extract_tileID(i_band)
     else:
-        i_band, y_band, j_band, h_band, tileID = find_images_in_directory(args.path)
+        i_band, y_band, j_band, h_band, tileID = find_images_in_directory(args.path, parser)
 
     if args.output == "TILE[id].tiff":
         args.output = tileID
@@ -421,10 +427,10 @@ def main():
     # Keep main simple; let the helper function handle the parser
     args, parser = parse_arguments()
     
-    B,G,R,L,wcs = rescale_and_blend(args)
+    B,G,R,L,wcs = rescale_and_blend(args, parser)
     asinh_scale(B,G,R,L,args)
     normalise_floats(B,G,R,L,args)
-    curve_adjustment(L,args)
+    contrast_adjustment(L,args)
     colorise_L(B,G,R,L,wcs,args,parser)
 
 if __name__=="__main__":
