@@ -25,8 +25,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import sys, os, glob, argparse, cv2, gc, re, tifffile, psutil, numpy as np
+import sys, os, glob, argparse, cv2, gc, re, tifffile
 from astropy.io import fits
+import numpy as ne
 import numexpr as ne
 from importlib.metadata import version, PackageNotFoundError    # to pull the version number from pyproject.toml
 from concurrent.futures import ThreadPoolExecutor
@@ -184,19 +185,16 @@ def asinh_scale_and_normalise(B, G, R, L, args):
 
         
 def repair_bad_pixels(B, G, R, L, args):
-    """
-    Refined sequential repair function. 
-    Uses NumExpr for high-performance, multi-threaded array operations 
-    without the risks of manual ThreadPoolExecutor overlaps.
-    """
     print("Repairing bad pixels")
     
+    mask = np.empty(L.shape, dtype=bool)
+
     # 1. Inpaint bad NISP pixels with VIS (keeps luminosity but removes color artifacts)
     # If any NISP band is unknown, replace all pixels with L (make it greyscale)
-    nisp_mask = ne.evaluate("((B==0) | (G==0) | (R==0)) & (L!=0)")
-    ne.evaluate("where(nisp_mask, L, B)", out=B)
-    ne.evaluate("where(nisp_mask, L, G)", out=G)
-    ne.evaluate("where(nisp_mask, L, R)", out=R)
+    ne.evaluate("((B==0) | (G==0) | (R==0)) & (L!=0)", out=mask)
+    ne.evaluate("where(mask, L, B)", out=B)
+    ne.evaluate("where(mask, L, G)", out=G)
+    ne.evaluate("where(mask, L, R)", out=R)
 
     # 2. Inpaint bad VIS pixels with NISP average
     avg_nir = "(B + G + R) / 3.0"
@@ -217,28 +215,28 @@ def repair_bad_pixels(B, G, R, L, args):
         thresh1, thresh2, thresh3, thresh4 = 5, 5, 3, 20
         
         # Identify hot pixels in each channel
-        maskB = ne.evaluate("(B > th1) & (B > th2 * (G+R+L)/3)",
-                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2})
-        ne.evaluate("where(maskB, (G+R+L)/3, B)", out=B)
+        ne.evaluate("(B > th1) & (B > th2 * (G+R+L)/3)",
+                    local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2}, out=mask)
+        ne.evaluate("where(mask, (G+R+L)/3, B)", out=B)
 
-        maskG = ne.evaluate("(G > th1) & (G > th2 * (B+R+L)/3)",
-                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2})
-        ne.evaluate("where(maskG, (B+R+L)/3, G)", out=G)
+        ne.evaluate("(G > th1) & (G > th2 * (B+R+L)/3)",
+                    local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2}, out=mask)
+        ne.evaluate("where(mask, (B+R+L)/3, G)", out=G)
         
-        maskR = ne.evaluate("(R > th1) & (R > th2 * (B+G+L)/3)",
-                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2})
-        ne.evaluate("where(maskR, (B+G+L)/3, R)", out=R)
+        ne.evaluate("(R > th1) & (R > th2 * (B+G+L)/3)",
+                    local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2}, out=mask)
+        ne.evaluate("where(mask, (B+G+L)/3, R)", out=R)
         
-        maskL = ne.evaluate("(L > th3) & (L > th4 * (B+G+R)/3)",
-                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th3':thresh3,'th4':thresh4})
-        ne.evaluate("where(maskL, (B+G+R)/3, L)", out=L)
+        ne.evaluate("(L > th3) & (L > th4 * (B+G+R)/3)",
+                    local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th3':thresh3,'th4':thresh4}, out=mask)
+        ne.evaluate("where(mask, (B+G+R)/3, L)", out=L)
 
     # 4. Final Saturated Pixel Handling
     # Use a high value (white) for any remaining clipped/zero pixels
-    mask_any_zero = ne.evaluate("(B==0) | (G==0) | (R==0) | (L==0)")
-    B[mask_any_zero] = 1e5
-    G[mask_any_zero] = 1e5
-    R[mask_any_zero] = 1e5
+    ne.evaluate("(B==0) | (G==0) | (R==0) | (L==0)", out=mask)
+    B[mask] = 1e5
+    G[mask] = 1e5
+    R[mask] = 1e5
 
     
 def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09):
@@ -251,18 +249,10 @@ def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09):
                 local_dict={'image': image, 'blurred': blurred, 'threshold': threshold, 'strength': strength},
                 out=image)
 
-    """
-    # old two-step version
-    ne.evaluate("image - blurred", local_dict={'image': image, 'blurred': blurred}, out=blurred)
-    mask = blurred  # doesn't cost anything, clearer code
-    ne.evaluate("where(abs(mask) >= threshold, image + strength * mask, image)",
-                local_dict={'mask': mask, 'image': image, 'threshold': threshold, 'strength': strength},
-                out=image)
-    """
-    
     # Clip in-place
     ne.evaluate("where(image > 1, 1, where(image < 0, 0, image))", out=image)
 
+    
 # WCS extraction
 def extract_wcs(fits_path):
     with fits.open(fits_path) as hdul:
@@ -329,7 +319,7 @@ def rescale_and_blend(args,parser):
             # ne.evaluate handles the division in-place to stay in CPU cache
             ne.evaluate("data / scale", local_dict={'data': data, 'scale': scale}, out=data)
 
-            
+    # Fix bad pixels
     repair_bad_pixels(y_data, j_data, h_data, i_data, args)
 
     # 1. Blending B channel
@@ -350,14 +340,18 @@ def rescale_and_blend(args,parser):
     # 3. Blending L (Luminance) channel
     fr = args.fr
     if fr > 0:
-        exp_fac = ne.evaluate("exp(-0.2 * abs(i_data))")
-        L = ne.evaluate("(i_data + fr * exp_fac * h_data) / (1.0 + fr * exp_fac)",
-                        local_dict={'i_data': i_data, 'h_data': h_data, 'fr': fr, 'exp_fac': exp_fac})
+        L = ne.evaluate("(i_data + fr * exp(-0.2*abs(i_data)) * h_data) / (1.0 + fr * exp(-0.2*abs(i_data)))",
+                        local_dict={'i_data': i_data, 'h_data': h_data, 'fr': fr})
     else:
         L = i_data
 
     # R-band
     R = h_data
+
+    # Free temporaries that are no longer aliased by B, G, R, L
+    y_data = None               # consumed into B
+    if fr > 0: i_data = None    # consumed into L; if fr==0, L=i_data so keep it
+    gc.collect()
 
     return B, G, R, L, wcs
 
@@ -370,9 +364,9 @@ def write_output(rgb, wcs, args):
         output_path,
         rgb,
         metadata=wcs,
-        tile=(512,512),
-        compression=None,
-        maxworkers=args.nthreads  # Use all cores for the tiling/formatting
+        compression=None
+        # tile=(512,512),           # slows down the write on fast-I/O systems 
+        # maxworkers=args.nthreads  # Use all cores for the tiling
     )
 
     # Free the input buffer
@@ -395,8 +389,7 @@ def rgb_lab_rgb_OpenCV(rgb, L, args):
     # Convert RGB to CIELab
     # Lab space: [0] = Lightness, [1] = a (green-red), [2] = b (blue-yellow)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab)
-    rgb = None
-    gc.collect()
+    rgb = None; gc.collect()
 
     # 1. Scale saturation in-place 
     s = args.saturate
@@ -408,7 +401,11 @@ def rgb_lab_rgb_OpenCV(rgb, L, args):
 
     # 2. Assign the L (Luminance) channel
     # Lab Lightness is 0-100, so we stretch the L [0,1] section accordingly
-    lab[:, :, 0] = L * 100
+    # inefficient (creates temporary copy)
+    # lab[:, :, 0] = L * 100
+    # efficient: do it in Lab directly
+    ne.evaluate("L * 100.0", local_dict={'L': L}, out=lab[:, :, 0])
+    L = None; gc.collect()
 
     # 3. Convert back to RGB
     rgb = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
@@ -519,29 +516,37 @@ def colorise_L(B, G, R, L, wcs, args, parser):
     using the CIELab color space. Optimized for memory and speed.
     """
     # Stack channels into a float32 RGB image;
+
     # don't let numpy make a copy if data is already in 32bit (which it is, but anyway)
-    rgb = np.stack([R, G, B], axis=-1).astype(np.float32, copy=False)
-    
-    # Free up memory immediately
-    R = G = B = None
-    gc.collect()  # probably uneffective, but nonetheless, this function is the one with highest memory usage
+    # waste of memory, not used
+    # rgb = np.stack([R, G, B], axis=-1).astype(np.float32, copy=False)
+    # better:
+    rgb = np.empty((R.shape[0], R.shape[1], 3), dtype=np.float32)
+    rgb[:, :, 0] = R;  R = None
+    rgb[:, :, 1] = G;  G = None
+    rgb[:, :, 2] = B;  B = None
+    gc.collect()   # probably uneffective, but nonetheless, this function is the one with highest memory usage
 
     # OpenCV implementation / manual implementation
     # rgb = rgb_lab_rgb_manual(rgb, L, args)
     rgb = rgb_lab_rgb_OpenCV(rgb, L, args)
+    L = None   # ← free here, rgb_lab_rgb_OpenCV is done with it
+    gc.collect()
     
     # 4. Apply Unsharp Masking if enabled
     if args.UM is not None:
         fwhm, strength, threshold = args.UM
         unsharp_mask(rgb, fwhm, strength, threshold)
 
-    # 5. Prepare for output
+    # 5. Prepare for output (trying to be efficient, avoiding negative strides in memory so that tiffflib doesn't have to reorder)
     print("16-bit conversion")
-    rgb = (rgb * 65535).astype(np.uint16)
-    rgb = np.flipud(rgb)
+    rgb_out = np.empty(rgb.shape, dtype=np.uint16)
+    np.multiply(rgb[::-1], 65535, out=rgb_out, casting='unsafe')  # rgb_out is contiguous, written top-to-bottom
+    rgb = None
+    gc.collect()
 
     # 6. Be done
-    write_output(rgb, wcs, args)
+    write_output(rgb_out, wcs, args)
 
 
 # Main function
