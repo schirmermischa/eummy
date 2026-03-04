@@ -2,29 +2,34 @@
 # -*- coding: utf-8 -*-
 
 # eummy.py - A program to create color images from Euclid MER stacks
-# Copyright (C) 2025 Mischa Schirmer
 
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License,
-# or (at your option) any later version.
+# MIT License
 
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-# You should have received a copy of the GNU General Public License along with this program.
-# If not, see <https://www.gnu.org/licenses/>.
+# Copyright (c) [2026] [Mischa Schirmer]
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 import sys, os, glob, argparse, cv2, gc, re, tifffile, psutil, numpy as np
 from astropy.io import fits
-from skimage import img_as_uint, img_as_ubyte
-from scipy.ndimage import affine_transform
-from scipy.interpolate import InterpolatedUnivariateSpline
-from concurrent.futures import ThreadPoolExecutor
-import matplotlib.pyplot as plt
 import numexpr as ne
-from importlib.metadata import version  # to pull the version number from pyproject.toml
+from importlib.metadata import version, PackageNotFoundError    # to pull the version number from pyproject.toml
+from concurrent.futures import ThreadPoolExecutor
 
 # Custom formatter combining RawTextHelpFormatter and ArgumentDefaultsHelpFormatter
 class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -41,6 +46,7 @@ def parse_um(values):
             raise argparse.ArgumentTypeError("UM values must be numeric.")
     raise argparse.ArgumentTypeError("UM must be 'false' or exactly 3 floats")
 
+
 # Parse boolean arguments
 def str2bool(val):
     if isinstance(val, bool):
@@ -52,6 +58,7 @@ def str2bool(val):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
+
 # Command-line arguments
 def parse_arguments():
 # Try to get version, fallback to 'unknown' if not installed yet
@@ -60,6 +67,8 @@ def parse_arguments():
     except PackageNotFoundError:
         current_version = "dev"
 
+    print(f"\n   eummy v{version("eummy")} (Mischa Schirmer)\n")
+        
     parser = argparse.ArgumentParser(
         description="Creates a colour image from Euclid MER stacks.\nRunning \"eummy \" in the directory with your images is usually sufficient.\nYou can fine-tune the result with additional command-line arguments.",
         formatter_class=CustomHelpFormatter
@@ -71,81 +80,75 @@ def parse_arguments():
     parser.add_argument("--path", default=os.getcwd(), help="Absolute or relative path to MER stacks")
     parser.add_argument("--images", nargs=4, help="Input FITS files for bands: I Y J H (in this order), if not following the MER naming convention.")
 
-    parser.add_argument("--blackwhite", nargs=2, type=float, default=[-2, 10000],
+    parser.add_argument("--blackwhite", nargs=2, type=float, default=[-1.3, 7000],
                         help="Min/max thresholds in linear images (J-band reference)")
     parser.add_argument("--pivot", type=float, default=0.15, help="Fraction of max value used as pivot for compression")
-    parser.add_argument("--strength", default="single", help="Use single or double asinh() compression")
-    parser.add_argument("--contrast", type=float, default=None, help="Additional contrast curve (0: off, 1.0: EWS, 1.3: EDS")
+    parser.add_argument("--contrast", type=float, default=None, help="Additional contrast curve (1.0: EWS (auto), 1.6: EDS (auto), 0: off)")
 
-    parser.add_argument("--scales", nargs=4, type=float, default=[0.00234, 0.65, 1.00, 1.14],
+    parser.add_argument("--scales", nargs=4, type=float, default=[0.002336, 0.6532, 1.0000, 1.1448],
                         help="Scaling factors for bands I, Y, J, H")
 
-    parser.add_argument("--rf", type=float, default=0.3, help="Red blending fraction for L channel")
-    parser.add_argument("--bf", type=float, default=0.6, help="Blue blending fraction for B channel")
-    parser.add_argument("--saturation", type=float, default=2.5, help="Saturation factor")
-    parser.add_argument("--mask", nargs="?", default=True, const=True, type=str2bool,
+    parser.add_argument("--fr", type=float, default=0.3, help="H blending fraction for L channel")
+    parser.add_argument("--fi", type=float, default=1.6, help="I blending fraction for B channel")
+    parser.add_argument("--saturate", type=float, default=2.5, help="Colour saturation factor")
+    parser.add_argument("--mask", nargs="?", default=None, const=True, type=str2bool,
                         help="Mask hot pixels; automatically applied to EWS images unless set to false")
     parser.add_argument("--mergeYJ", action="store_true", help="Average Y and J into green channel")
 
     parser.add_argument("--UM", nargs="*", default=["1.6", "0.75", "0.09"],
                         help="Unsharp masking: FWHM strength threshold, or 'false' to disable")
 
-    parser.add_argument("--output", default="TILE[id].tiff", help="Output file name")
+    parser.add_argument("--output", default="TILE[id].tif", help="Output file name")
     parser.add_argument("--nthreads", type=int, default=os.cpu_count() // 2, help="Number of threads to use for parallel operations")
 
     args = parser.parse_args()
     args.UM = parse_um(args.UM)
     return args, parser
 
-# Contrast adjustment
-_curve_data = np.array([
-    [0.0000, 0.0000],[0.0111, 0.0282],[0.0264, 0.0672],[0.0438, 0.1089],
-    [0.0556, 0.1331],[0.0771, 0.1761],[0.0944, 0.2083],[0.1139, 0.2433],
-    [0.1396, 0.2849],[0.1875, 0.3602],[0.2236, 0.4153],[0.2528, 0.4610],
-    [0.2917, 0.5148],[0.3243, 0.5538],[0.3493, 0.5820],[0.3757, 0.6142],
-    [0.3993, 0.6411],[0.4611, 0.7083],[0.4903, 0.7352],[0.5153, 0.7581],
-    [0.5500, 0.7863],[0.5785, 0.8078],[0.6250, 0.8387],[0.6597, 0.8589],
-    [0.6868, 0.8750],[0.7292, 0.8965],[0.7889, 0.9261],[0.8708, 0.9583],
-    [0.9410, 0.9825],[1.0000, 1.0000]
-])
 
 def contrast_adjustment(L, args):
+    """
+    Adjusts the contrast of the L channel using a 3rd order polynomial.
+    Uses NumExpr for thread-safe, cache-efficient computation.
+    """
     if args.contrast == 0:
-        return
-    
+        return    # no contrast adjustment requested; L is unchanged
+
     height, width = L.shape
-    # EDS
+    # Determine default contrast based on image dimensions (EDS vs EWS)
     if args.contrast is None:
         if height == 10200 and width == 10200:
             args.contrast = 1.6
+            print(f"Enhancing contrast by {args.contrast} (default for EDS)")
         else:
             args.contrast = 1.0
-    
-    print(f"Enhancing contrast by {args.contrast}")
-    x = _curve_data[:, 0]
-    y = args.contrast * (_curve_data[:, 1] - x) + x
-    spline = InterpolatedUnivariateSpline(x, y)
+            print(f"Enhancing contrast by {args.contrast} (default for EWS)")
+    else:
+        print(f"Enhancing contrast by {args.contrast}")
 
-    L_flat = L.ravel()
-    n = len(L_flat)
-    chunk_size = n // args.nthreads
+    # The polynomial: y = 0.5707*x^3 - 1.8298*x**2 + 2.2592*x
+    # The adjustment logic: args.contrast * (y_poly - x) + x
+    c = args.contrast
+   
+    # Horner's method to avoid invokation of power law. numexpr does it alright, though
+#    ne.evaluate("c * (L * (2.2592 + L * (-1.8298 + L * 0.5707)) - L) + L",
+#                local_dict={'L': L, 'c': c}, out=L)
 
-    def process_chunk(start_idx):
-        end_idx = min(start_idx + chunk_size, n)
-        L_flat[start_idx:end_idx] = spline(L_flat[start_idx:end_idx])
+    ne.evaluate(
+        "c * (0.5707 * L**3 - 1.8298 * L**2 + 2.2592 * L - L) + L",
+        local_dict={'L': L, 'c': c}, out=L)
 
-    with ThreadPoolExecutor(max_workers=args.nthreads) as executor:
-        executor.map(process_chunk, range(0, n, chunk_size))
 
 # Extract TILE ID
 def extract_tileID(filename):
     filename = os.path.basename(filename)
     match = re.search(r'(TILE\d+)\D', filename)
     if match:
-        return match.group(1) + ".tiff"
+        return match.group(1) + ".tif"
     else:
-        return "TILE.tiff"
+        return "TILE.tif"
 
+    
 # Find images
 def find_images_in_directory(path, parser):
     vis_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-VIS*.fits"))
@@ -161,173 +164,104 @@ def find_images_in_directory(path, parser):
     tileID = extract_tileID(vis_images[0])
     return vis_images[0], nir_y_images[0], nir_j_images[0], nir_h_images[0], tileID
 
-# Dynamic-range compression
-def asinh_scale(B, G, R, L, args):
-    print("Dynamic-range compression")
+
+def asinh_scale_and_normalise(B, G, R, L, args):
+    """
+    Fuses asinh scaling and normalisation into a single pass per channel.
+    Avoids a full read+write cycle over all four arrays.
+    """
+    print(f"Dynamic-range compression (pivot {args.pivot}) and normalisation [{args.blackwhite[0]}, {args.blackwhite[1]}]")
     p = args.pivot
-    channels = [B, G, R, L]
-
-    def process_array(channel):
-        flat = channel.ravel()
-        n = len(flat)
-        chunk_size = n // args.nthreads
-
-        def worker(start_idx):
-            end_idx = min(start_idx + chunk_size, n)
-            if args.strength == "single":
-                flat[start_idx:end_idx] = np.arcsinh(p * flat[start_idx:end_idx])
-            else:
-                flat[start_idx:end_idx] = np.arcsinh(p * np.arcsinh(p * flat[start_idx:end_idx])) / p
-
-        with ThreadPoolExecutor(max_workers=args.nthreads) as executor:
-            executor.map(worker, range(0, n, chunk_size))
-
-    for ch in channels:
-        process_array(ch)
-
-# Normalization
-def normalise_channel(ch, black, scale):
-    np.subtract(ch, black, out=ch)
-    np.multiply(ch, scale, out=ch)
-    np.clip(ch, 0, 1, out=ch)
-
-def normalise_floats(B, G, R, L, args):
-    print(f"Setting black/white points {args.blackwhite}")
-    black, white = (-0.22, 8.5) if args.strength == "single" else (-0.22, 6.8)
+    minval, maxval = args.blackwhite
+    black = np.arcsinh(p * minval)
+    white = np.arcsinh(p * maxval)
     scale = 1.0 / (white - black)
-    channels = [B, G, R, L]
-    with ThreadPoolExecutor(max_workers=args.nthreads) as executor:
-        executor.map(lambda ch: normalise_channel(ch, black, scale), channels)
 
-"""
-# Repair bad pixels
+    for ch in [B, G, R, L]:
+        ne.evaluate("(arcsinh(p * ch) - black) * scale",
+                    local_dict={'ch': ch, 'p': p, 'black': black, 'scale': scale},
+                    out=ch)
+
+        
 def repair_bad_pixels(B, G, R, L, args):
+    """
+    Refined sequential repair function. 
+    Uses NumExpr for high-performance, multi-threaded array operations 
+    without the risks of manual ThreadPoolExecutor overlaps.
+    """
     print("Repairing bad pixels")
-    maskval = 0
-    thresh1, thresh2 = 10.0, 20.0
+    
+    # 1. Inpaint bad NISP pixels with VIS (keeps luminosity but removes color artifacts)
+    # If any NISP band is unknown, replace all pixels with L (make it greyscale)
+    nisp_mask = ne.evaluate("((B==0) | (G==0) | (R==0)) & (L!=0)")
+    ne.evaluate("where(nisp_mask, L, B)", out=B)
+    ne.evaluate("where(nisp_mask, L, G)", out=G)
+    ne.evaluate("where(nisp_mask, L, R)", out=R)
 
-    def inpaint_nisp():
-        mask = ne.evaluate("((B==0) | (G==0) | (R==0)) & (L!=0)", local_dict={'B':B,'G':G,'R':R,'L':L})
-        B[mask] = G[mask] = R[mask] = L[mask]  # replace NIR channels with L
+    # 2. Inpaint bad VIS pixels with NISP average
+    avg_nir = "(B + G + R) / 3.0"
+    ne.evaluate(f"where((B!=0) & (G!=0) & (R!=0) & (L==0), {avg_nir}, L)", out=L)
 
-    def inpaint_vis():
-        mask = ne.evaluate("(B!=0) & (G!=0) & (R!=0) & (L==0)", local_dict={'B':B,'G':G,'R':R,'L':L})
-        L[mask] = ne.evaluate("(B+G+R)/3", local_dict={'B':B,'G':G,'R':R})[mask]
-
-    def saturate():
-        mask = ne.evaluate("(B==0) | (G==0) | (R==0) | (L==0)", local_dict={'B':B,'G':G,'R':R,'L':L})
-        B[mask] = G[mask] = R[mask] = maskval
-
-    # Mask hot pixels (especially for wide survey, doesn't really get invoked for deep which is very clean)
+    # 3. Handle Hot Pixels
+    # Done sequentially to avoid race conditions on shared arrays; exploiting numpy's internal vectorisation
     # This might mask objects with very strong colors, in this case set --mask false
-
     height, width = L.shape
-    if height > 15000 and width > 15000:
-#    if args.mask:
-        thresh1 = 10.     # minimum brightness to be considered as a hot pixel
-        thresh2 = 20.     # checking that it's really a hot pixel (could mask extremely colourful objects)
-        maskB = (B > thresh1) & (B > thresh2*G)
-        maskG = (G > thresh1) & (G > thresh2*R)
-        maskR = (R > thresh1) & (R > thresh2*G)
-        maskL = (L > thresh1) & (L > thresh2*B)
-        indicesB = np.where(maskB)
-        indicesG = np.where(maskG)
-        indicesR = np.where(maskR)
-        indicesL = np.where(maskL)
-        B[indicesB] = (G[indicesB] + R[indicesB]) / 2.
-        G[indicesG] = (B[indicesG] + R[indicesG]) / 2.
-        R[indicesR] = (B[indicesR] + G[indicesR]) / 2.
-        L[indicesL] = (B[indicesL] + G[indicesL] + R[indicesL]) / 3.
+
+    #--mask not provided -> None -> auto-applies only for large images
+    #--mask (no value) -> True -> always apply
+    #--mask false -> False -> never apply
+    if (height > 15000 and width > 15000 and args.mask is not False) or args.mask is True:
+
+        # thresh4 must be comparatively high because VIS PSF is very compact;
+        # otherwise be stamp out the cores of compact stars
+        thresh1, thresh2, thresh3, thresh4 = 5, 5, 3, 20
+        
+        # Identify hot pixels in each channel
+        maskB = ne.evaluate("(B > th1) & (B > th2 * (G+R+L)/3)",
+                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2})
+        ne.evaluate("where(maskB, (G+R+L)/3, B)", out=B)
+
+        maskG = ne.evaluate("(G > th1) & (G > th2 * (B+R+L)/3)",
+                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2})
+        ne.evaluate("where(maskG, (B+R+L)/3, G)", out=G)
+        
+        maskR = ne.evaluate("(R > th1) & (R > th2 * (B+G+L)/3)",
+                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1':thresh1,'th2':thresh2})
+        ne.evaluate("where(maskR, (B+G+L)/3, R)", out=R)
+        
+        maskL = ne.evaluate("(L > th3) & (L > th4 * (B+G+R)/3)",
+                            local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th3':thresh3,'th4':thresh4})
+        ne.evaluate("where(maskL, (B+G+R)/3, L)", out=L)
+
+    # 4. Final Saturated Pixel Handling
+    # Use a high value (white) for any remaining clipped/zero pixels
+    mask_any_zero = ne.evaluate("(B==0) | (G==0) | (R==0) | (L==0)")
+    B[mask_any_zero] = 1e5
+    G[mask_any_zero] = 1e5
+    R[mask_any_zero] = 1e5
 
     
-    def hot_pixels():
-        maskB = ne.evaluate("(B>th1) & (B>th2*G)", local_dict={'B':B,'G':G,'th1':thresh1,'th2':thresh2})
-        maskG = ne.evaluate("(G>th1) & (G>th2*R)", local_dict={'G':G,'R':R,'th1':thresh1,'th2':thresh2})
-        maskR = ne.evaluate("(R>th1) & (R>th2*G)", local_dict={'R':R,'G':G,'th1':thresh1,'th2':thresh2})
-        maskL = ne.evaluate("(L>th1) & (L>th2*B)", local_dict={'L':L,'B':B,'th1':thresh1,'th2':thresh2})
-        B[maskB] = (G[maskB] + R[maskB]) / 2
-        G[maskG] = (B[maskG] + R[maskG]) / 2
-        R[maskR] = (B[maskR] + G[maskR]) / 2
-        L[maskL] = (B[maskL] + G[maskL] + R[maskL])/3
-
-    funcs = [inpaint_nisp, inpaint_vis, saturate]
-    if args.mask:
-        funcs.append(hot_pixels)
-
-    with ThreadPoolExecutor(max_workers=args.nthreads) as executor:
-        futures = [executor.submit(f) for f in funcs]
-        for f in futures: f.result()
-
-"""
-def repair_bad_pixels(B, G, R, L, args):
-    print("Repairing bad pixels")
-    # Inpaint bad NISP pixels with VIS (making them grey-scale, while still preserving luminosity)
-    mask = ((B == 0) | (G == 0) | (R == 0)) & (L != 0)
-    indices = np.where(mask)
-    B[indices] = L[indices]
-    G[indices] = L[indices]
-    R[indices] = L[indices]
-
-    # Inpaint bad VIS pixels with NISP values
-    mask = (B != 0) & (G != 0) & (R != 0) & (L == 0)
-    indices = np.where(mask)
-    L[indices] = (B[indices] + G[indices] + R[indices])/3.  
-
-    # Make saturated pixels white (stellar cores, etc)
-    mask = (B == 0) | (G == 0) | (R == 0) | (L == 0)
-    indices = np.where(mask)
-    maskval = 1e5
-    B[indices] = maskval
-    G[indices] = maskval
-    R[indices] = maskval
-
-    # Mask hot pixels (especially for wide survey, doesn't really get invoked for deep which is very clean)
-    # This might mask objects with very strong colors, in this case set --mask false
-
-    # Get the dimensions
-    height, width = L.shape
-    if height > 15000 and width > 15000:
-#    if args.mask:
-        thresh1 = 10.     # minimum brightness to be considered as a hot pixel
-        thresh2 = 20.     # checking that it's really a hot pixel (could mask extremely colourful objects)
-        maskB = (B > thresh1) & (B > thresh2*G)
-        maskG = (G > thresh1) & (G > thresh2*R)
-        maskR = (R > thresh1) & (R > thresh2*G)
-        maskL = (L > thresh1) & (L > thresh2*B)
-        indicesB = np.where(maskB)
-        indicesG = np.where(maskG)
-        indicesR = np.where(maskR)
-        indicesL = np.where(maskL)
-        B[indicesB] = (G[indicesB] + R[indicesB]) / 2.
-        G[indicesG] = (B[indicesG] + R[indicesG]) / 2.
-        R[indicesR] = (B[indicesR] + G[indicesR]) / 2.
-        L[indicesL] = (B[indicesL] + G[indicesL] + R[indicesL]) / 3.
-
-
-
-# Unsharp mask
-def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09, n_threads=8):
+def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09):
     print(f"Unsharp masking with {radius, strength, threshold}")
     ksize = max(3, int(2*round(radius*2.5)+1))
     blurred = cv2.GaussianBlur(image, (ksize, ksize), radius)
-    mask = image - blurred
-    H = image.shape[0]
-    chunk_size = H // n_threads
 
-    def process_rows(start, end):
-        mask_chunk = mask[start:end,:]
-        mask_chunk *= (np.abs(mask_chunk) >= threshold)
-        image_chunk = image[start:end,:]
-        image_chunk += strength * mask_chunk
-        np.clip(image_chunk, 0, 1, out=image_chunk)
+    # Fuse mask computation and sharpening into a single pass; no intermediate buffer needed
+    ne.evaluate("where(abs(image - blurred) >= threshold, image + strength * (image - blurred), image)",
+                local_dict={'image': image, 'blurred': blurred, 'threshold': threshold, 'strength': strength},
+                out=image)
 
-    with ThreadPoolExecutor(max_workers=n_threads) as executor:
-        futures = []
-        for i in range(n_threads):
-            start = i*chunk_size
-            end = (i+1)*chunk_size if i<n_threads-1 else H
-            futures.append(executor.submit(process_rows, start, end))
-        for f in futures: f.result()
+    """
+    # old two-step version
+    ne.evaluate("image - blurred", local_dict={'image': image, 'blurred': blurred}, out=blurred)
+    mask = blurred  # doesn't cost anything, clearer code
+    ne.evaluate("where(abs(mask) >= threshold, image + strength * mask, image)",
+                local_dict={'mask': mask, 'image': image, 'threshold': threshold, 'strength': strength},
+                out=image)
+    """
+    
+    # Clip in-place
+    ne.evaluate("where(image > 1, 1, where(image < 0, 0, image))", out=image)
 
 # WCS extraction
 def extract_wcs(fits_path):
@@ -338,98 +272,287 @@ def extract_wcs(fits_path):
                                          'CRPIX1','CRPIX2','CD1_1','CD1_2','CD2_1','CD2_2']}
     return wcs
 
-# Blending functions
-def blend_B(args, i_data, y_data):
-    return i_data if args.mergeYJ else (i_data + y_data*args.bf)/(1+args.bf)
-def blend_G(args, y_data, j_data):
-    return (y_data+j_data)*0.5 if args.mergeYJ else j_data
-def blend_L(args, i_data, h_data):
-    if args.rf>0:
-        exp_factor = np.exp(-0.2*np.abs(i_data))
-        return (i_data + args.rf*h_data*exp_factor)/(1.0 + args.rf*exp_factor)
-    return i_data
 
-# Rescale and blend
-def rescale_and_blend(args, parser):
+def rescale_and_blend(args,parser):
     if not os.path.isdir(args.path):
         print(f"Error: Directory '{args.path}' does not exist.")
         sys.exit(1)
 
+    # If the --images argument is provided
     if args.images:
         i_band, y_band, j_band, h_band = args.images
         tileID = extract_tileID(i_band)
+        
     else:
+        # look for images in the specified directory
         i_band, y_band, j_band, h_band, tileID = find_images_in_directory(args.path, parser)
 
-    if args.output == "TILE[id].tiff":
+    # determine the final output file name
+    if args.output == "TILE[id].tif":
+        # default, user did not provide anything on the command line; override with automatic value
         args.output = tileID
 
-    scale_i, scale_y, scale_j, scale_h = args.scales
-    print("\nProcessing FITS images")
-    i_data = fits.getdata(os.path.join(args.path,i_band))/scale_i
-    y_data = fits.getdata(os.path.join(args.path,y_band))/scale_y
-    j_data = fits.getdata(os.path.join(args.path,j_band))/scale_j
-    h_data = fits.getdata(os.path.join(args.path,h_band))/scale_h
+    # Extract individual scale factors from the args
+    si, sy, sj, sh = args.scales
 
-    wcs = extract_wcs(os.path.join(args.path,i_band))
+    print("Processing FITS images")
+
+    def load_and_prep(file_path):
+        with fits.open(file_path) as hdul:
+            data = hdul[0].data
+            # Returns a view if already float32, otherwise converts in-place if possible
+            return np.asanyarray(data, dtype=np.float32)
+
+    # 2. Parallel Reading (I/O Bound)
+    # get file names, with a guard against the user providing absolute paths in both --path and --images
+    files = [f if os.path.isabs(f) else os.path.join(args.path, f) for f in [y_band, j_band, h_band, i_band]]
+    # Overlap disk-read latency for all four bands simultaneously
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        y_data, j_data, h_data, i_data = list(executor.map(load_and_prep, files))
+
+    # 3. Extract WCS from the VIS band (standard for Euclid MER);
+    # guard against double absolute paths in --path and --images
+    wcs = extract_wcs(i_band if os.path.isabs(i_band) else os.path.join(args.path, i_band))
+
+    # 4. Individual Pre-scaling (Parallel via NumExpr)
+    # We only perform the math if the scale factor is not 1.0
+    
+    scaling_tasks = [
+        (y_data, sy, "Y-band"),
+        (j_data, sj, "J-band"),
+        (h_data, sh, "H-band"),
+        (i_data, si, "VIS-band")
+    ]
+
+    for data, scale, name in scaling_tasks:
+        if scale != 1.0:
+            # ne.evaluate handles the division in-place to stay in CPU cache
+            ne.evaluate("data / scale", local_dict={'data': data, 'scale': scale}, out=data)
+
+            
     repair_bad_pixels(y_data, j_data, h_data, i_data, args)
 
-    with ThreadPoolExecutor(max_workers=args.nthreads) as executor:
-        future_B = executor.submit(blend_B, args, i_data, y_data)
-        future_G = executor.submit(blend_G, args, y_data, j_data)
-        future_R = executor.submit(lambda h: h, h_data)
-        future_L = executor.submit(blend_L, args, i_data, h_data)
-        B, G, R, L = future_B.result(), future_G.result(), future_R.result(), future_L.result()
+    # 1. Blending B channel
+    fi = args.fi
+    if args.mergeYJ:
+        B = i_data
+    else:
+        # Fuses addition and division into one pass
+        B = ne.evaluate("(y_data + i_data * fi) / (1.0 + fi)", 
+                        local_dict={'y_data': y_data, 'i_data': i_data, 'fi': fi})
+
+    # 2. Blending G channel
+    if args.mergeYJ:
+        G = ne.evaluate("(y_data + j_data) * 0.5", local_dict={'y_data': y_data, 'j_data': j_data})
+    else:
+        G = j_data
+
+    # 3. Blending L (Luminance) channel
+    fr = args.fr
+    if fr > 0:
+        exp_fac = ne.evaluate("exp(-0.2 * abs(i_data))")
+        L = ne.evaluate("(i_data + fr * exp_fac * h_data) / (1.0 + fr * exp_fac)",
+                        local_dict={'i_data': i_data, 'h_data': h_data, 'fr': fr, 'exp_fac': exp_fac})
+    else:
+        L = i_data
+
+    # R-band
+    R = h_data
 
     return B, G, R, L, wcs
 
-# Colorise L channel
-def colorise_L(B, G, R, L, wcs, args, parser):
-    rgb = np.stack([R,G,B], axis=-1).astype(np.float32)
-    R=G=B=None; gc.collect()
-    print(f"Increasing colour saturation to {args.saturation}")
+
+def write_output(rgb, wcs, args):
+    output_path = os.path.join(args.path, f"{args.output}")
+
+    print(f"Writing result to {output_path}")
+    tifffile.imwrite(
+        output_path,
+        rgb,
+        metadata=wcs,
+        tile=(512,512),
+        compression=None,
+        maxworkers=args.nthreads  # Use all cores for the tiling/formatting
+    )
+
+    # Free the input buffer
+    rgb = None
+    gc.collect()
+
+    # Update the symlink
+    link_name = os.path.join(args.path, "link.tif")
+    tmp_link = link_name + ".tmp"
+    try:
+        os.symlink(args.output, tmp_link)
+        os.replace(tmp_link, link_name)
+    except Exception as e:
+        if os.path.exists(tmp_link):
+            os.unlink(tmp_link)
+        raise
+
+def rgb_lab_rgb_OpenCV(rgb, L, args):
+    print("Color-space operations")
+    # Convert RGB to CIELab
+    # Lab space: [0] = Lightness, [1] = a (green-red), [2] = b (blue-yellow)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab)
-    rgb=None; gc.collect()
-    H = lab.shape[0]; chunk_size = H//args.nthreads
+    rgb = None
+    gc.collect()
 
-    def process_rows(start, end):
-        lab[start:end,:,1:] = np.clip(lab[start:end,:,1:]*args.saturation, -128,127)
-        lab[start:end,:,0] = L[start:end,:]*100
+    # 1. Scale saturation in-place 
+    s = args.saturate
+    for i in [1, 2]:  # Process 'a' and 'b' channels
+        ch_view = lab[:, :, i]
+        # Calculate saturation and clip to valid Lab range [-128, 127] in one pass
+        ne.evaluate("where(ch*s > 127, 127, where(ch*s < -128, -128, ch*s))", local_dict={'ch': ch_view, 's': s},
+                    out=ch_view)
 
-    with ThreadPoolExecutor(max_workers=args.nthreads) as executor:
-        futures = []
-        for i in range(args.nthreads):
-            start = i*chunk_size
-            end = (i+1)*chunk_size if i<args.nthreads-1 else H
-            futures.append(executor.submit(process_rows,start,end))
-        for f in futures: f.result()
+    # 2. Assign the L (Luminance) channel
+    # Lab Lightness is 0-100, so we stretch the L [0,1] section accordingly
+    lab[:, :, 0] = L * 100
 
-    rgb = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB); lab=None; gc.collect()
+    # 3. Convert back to RGB
+    rgb = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+    lab = None
+    gc.collect()
 
+    return rgb
+
+
+# Much 5x slower than the openCV implementation, because the latter uses a LUT for the power-law in the gamma function 
+# UNUSED. Shown for completeness, only
+def rgb_lab_rgb_manual(rgb, L, args):
+    print("Color-space operations")
+    # --- RGB -> Lab ---
+    # Step 1: Linear RGB to XYZ (D65, sRGB primaries matrix)
+    # gamma correction (can't skip)
+    ne.evaluate("where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)",
+                local_dict={'rgb': rgb}, out=rgb)
+
+    height, width = rgb.shape[:2]
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+
+    X = ne.evaluate("0.4124564*r + 0.3575761*g + 0.1804375*b")
+    Y = ne.evaluate("0.2126729*r + 0.7151522*g + 0.0721750*b")
+    Z = ne.evaluate("0.0193339*r + 0.1191920*g + 0.9503041*b")
+    rgb = None  # can't set to None before, because r, g, b are views into the array
+    gc.collect()
+
+    Xn = 0.95047
+    Yn = 1.00000
+    Zn = 1.08883
+    
+    # Step 2: Normalize by D65 white point
+    # Xn=0.95047, Yn=1.00000, Zn=1.08883
+    ne.evaluate("X / Xn", out=X)
+    ne.evaluate("Y / Yn", out=Y)
+    ne.evaluate("Z / Zn", out=Z)
+
+    # Step 3: Apply CIE f-function
+    # f(t) = t**(1/3) if t > 0.008856 else 7.787*t + 16/116
+    eps = 0.008856    # (6/29)**3
+    kappa = 7.7870     # 1/3 (29/6)**2
+    ne.evaluate("where(X > eps, X ** (1.0/3.0), kappa * X + 0.137931)",
+                local_dict={'X': X, 'eps': eps, 'kappa': kappa}, out=X)
+    ne.evaluate("where(Y > eps, Y ** (1.0/3.0), kappa * Y + 0.137931)",
+                local_dict={'Y': Y, 'eps': eps, 'kappa': kappa}, out=Y)
+    ne.evaluate("where(Z > eps, Z ** (1.0/3.0), kappa * Z + 0.137931)",
+                local_dict={'Z': Z, 'eps': eps, 'kappa': kappa}, out=Z)
+
+    # Step 4: Compute chrominance and apply saturation
+    s = args.saturate
+    # a = 500*(fX - fY), b_ch = 200*(fY - fZ), L_lab = 116*fY - 16
+    a_sat = ne.evaluate("500.0 * (X - Y) * s", local_dict={'X': X, 'Y': Y, 's': s})
+    b_sat = ne.evaluate("200.0 * (Y - Z) * s", local_dict={'Y': Y, 'Z': Z, 's': s})
+    # clamping to valid range
+    ne.evaluate("where(a_sat >  127,  127, where(a_sat < -128, -128, a_sat))", local_dict={'a_sat': a_sat}, out=a_sat)
+    ne.evaluate("where(b_sat >  127,  127, where(b_sat < -128, -128, b_sat))", local_dict={'b_sat': b_sat}, out=b_sat)
+
+    # Use passed-in L for lightness instead of the computed one
+    light = ne.evaluate("L * 100.0", local_dict={'L': L})
+
+    # --- Lab -> RGB ---
+    # Step 5: Lab -> XYZ
+    ne.evaluate("(light + 16.0) / 116.0", local_dict={'light': light}, out=Y)
+    ne.evaluate("Y + a_sat / 500.0", local_dict={'Y': Y, 'a_sat': a_sat}, out=X)
+    ne.evaluate("Y - b_sat / 200.0", local_dict={'Y': Y, 'b_sat': b_sat}, out=Z)
+
+    # recompute eps
+    eps = 0.206896   # 6/29, no power-of-three here!
+    ne.evaluate("where(Y > eps, Y**3, (Y - 0.137931) / kappa)",
+                local_dict={'Y': Y, 'eps': eps, 'kappa': kappa}, out=Y)
+    ne.evaluate("where(X > eps, X**3, (X - 0.137931) / kappa)",
+                local_dict={'X': X, 'eps': eps, 'kappa': kappa}, out=X)
+    ne.evaluate("where(Z > eps, Z**3, (Z - 0.137931) / kappa)",
+                local_dict={'Z': Z, 'eps': eps, 'kappa': kappa}, out=Z)
+
+    # Re-apply D65 white point
+    ne.evaluate("X * Xn", out=X)
+    ne.evaluate("Y * Yn", out=Y)
+    ne.evaluate("Z * Zn", out=Z)
+
+    # Step 6: XYZ -> linear RGB (inverse sRGB matrix)
+    r = ne.evaluate("3.2404542*X - 1.5371385*Y - 0.4985314*Z")
+    g = ne.evaluate("-0.9692660*X + 1.8760108*Y + 0.0415560*Z")
+    b = ne.evaluate("0.0556434*X - 0.2040259*Y + 1.0572252*Z")
+    X = Y = Z = a_sat = b_sat = L_lab = None
+    gc.collect()
+
+    # Step 7: Apply sRGB gamma and clip
+    ne.evaluate("where(r > 0.0031308, 1.055 * r**(1.0/2.4) - 0.055, 12.92 * r)", out=r)
+    ne.evaluate("where(g > 0.0031308, 1.055 * g**(1.0/2.4) - 0.055, 12.92 * g)", out=g)
+    ne.evaluate("where(b > 0.0031308, 1.055 * b**(1.0/2.4) - 0.055, 12.92 * b)", out=b)
+
+    # clamp and stack back
+    ne.evaluate("where(r > 1, 1, where(r < 0, 0, r))", out=r)
+    ne.evaluate("where(g > 1, 1, where(g < 0, 0, g))", out=g)
+    ne.evaluate("where(b > 1, 1, where(b < 0, 0, b))", out=b)
+    rgb = np.stack([r, g, b], axis=-1)
+    r = g = b = None
+
+    return rgb
+
+def colorise_L(B, G, R, L, wcs, args, parser):
+    """
+    Combines the processed R, G, B channels with the L (Luminance) channel 
+    using the CIELab color space. Optimized for memory and speed.
+    """
+    # Stack channels into a float32 RGB image;
+    # don't let numpy make a copy if data is already in 32bit (which it is, but anyway)
+    rgb = np.stack([R, G, B], axis=-1).astype(np.float32, copy=False)
+    
+    # Free up memory immediately
+    R = G = B = None
+    gc.collect()  # probably uneffective, but nonetheless, this function is the one with highest memory usage
+
+    # OpenCV implementation / manual implementation
+    # rgb = rgb_lab_rgb_manual(rgb, L, args)
+    rgb = rgb_lab_rgb_OpenCV(rgb, L, args)
+    
+    # 4. Apply Unsharp Masking if enabled
     if args.UM is not None:
         fwhm, strength, threshold = args.UM
-        unsharp_mask(rgb, fwhm, strength, threshold, args.nthreads)
+        unsharp_mask(rgb, fwhm, strength, threshold)
 
-    rgb = (rgb*65535).astype(np.uint16)
-    rgb[:] = rgb[::-1,:,:]
+    # 5. Prepare for output
+    print("16-bit conversion")
+    rgb = (rgb * 65535).astype(np.uint16)
+    rgb = np.flipud(rgb)
 
-    print("Writing result to ...", end='', flush=True)
-    tifffile.imwrite(os.path.join(args.path,f"{args.output}"), rgb, metadata=wcs)
-    print(f" {args.path}/{args.output}")
+    # 6. Be done
+    write_output(rgb, wcs, args)
 
-    link_name = f"{args.path}/link.tiff"
-    if os.path.islink(link_name) or os.path.exists(link_name):
-        os.remove(link_name)
-    os.symlink(f"{args.path}/{args.output}", link_name)
 
 # Main function
 def main():
     # Keep main simple; let the helper function handle the parser
     args, parser = parse_arguments()
+    ne.set_num_threads(args.nthreads)
+    cv2.setNumThreads(args.nthreads)   # probably uneffective, but just in case
     
     B,G,R,L,wcs = rescale_and_blend(args, parser)
-    asinh_scale(B,G,R,L,args)
-    normalise_floats(B,G,R,L,args)
+    asinh_scale_and_normalise(B,G,R,L,args)
     contrast_adjustment(L,args)
     colorise_L(B,G,R,L,wcs,args,parser)
 
