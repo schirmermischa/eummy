@@ -103,20 +103,51 @@ def parse_arguments():
     parser.add_argument("--contrast", type=float, default=None, help="Additional contrast curve (1.0: EWS (auto), 1.6: EDS (auto), 0: off)")
 
     # --- Band scaling and blending ---
-    parser.add_argument("--scales", nargs=4, type=float, default=[0.002336, 0.6532, 1.0000, 1.1448],
-                        help="Scaling factors for bands I, Y, J, H")
+    # Q1 / RR2 values
+    #    parser.add_argument("--scales", nargs=4, type=float, default=[0.002336, 0.6532, 1.0000, 1.1448],
+    # DR1 values
+    parser.add_argument("--scales", nargs=4, type=float, default=[0.002039, 0.5950, 1.0000, 1.0985],
+                        help="Scaling factors for bands I Y J H")
     parser.add_argument("--fr", type=float, default=0.3, help="H-blending fraction for L channel")
-    parser.add_argument("--fi", type=float, default=1.6, help="I-blending fraction for B channel")
-    parser.add_argument("--mergeYJ", action="store_true", help="Average Y and J into green channel, uses I for blue; overrides --fi")
+    parser.add_argument("--blendIY", action="store_true",
+                        help="Blend I and Y into blue channel (B = (Y + fi*I)/(1+fi)), with J as green.\n"
+                             "Default mode uses I for blue and average(Y,J) for green.")
+    parser.add_argument("--fi", type=float, default=1.6, help="I-blending fraction for B channel (only with --blendIY)")
 
     # --- Colour and image quality ---
-    parser.add_argument("--saturate", type=float, default=2.5, help="Colour saturation factor")
+    parser.add_argument("--saturate", nargs="+", type=float, default=[2.0],
+                        help="Colour saturation factor(s).  One value: applied to both a* and b*.\n"
+                             "Two values: applied to a* and b* separately.")
     parser.add_argument("--mask", nargs="?", default=None, const=True, type=str2bool,
-                        help="Mask hot pixels; automatically applied to EWS images unless set to false")
+                        help="Mask hot pixels; automatically applied to EWS images unless set to False")
     parser.add_argument("--useOpenCV", nargs="?", default=True, const=True, type=str2bool,
                         help="Use OpenCV for colour-space operations; high RAM usage and slower if set to False")
     parser.add_argument("--UM", nargs="*", default=["1.6", "0.75", "0.09"],
-                        help="Unsharp masking: FWHM strength threshold, or 'false' to disable")
+                        help="Unsharp masking: FWHM strength threshold, or False to disable")
+    parser.add_argument("--cvd", nargs="?", type=float, default=None, const=1.0, metavar="K",
+                        help="Apply daltonization for red-green colour-vision deficient viewers\n"
+                             "(Fidaner, Lin & Ozguven 2005, based on Vienot+1999 simulation).\n"
+                             "Simulates the dichromat view, computes the colour error, and\n"
+                             "redistributes it onto the channels the observer can discriminate.\n"
+                             "Applied to B, G, R flux arrays in linear space before the arcsinh\n"
+                             "stretch. White and grey tones are exactly preserved.\n"
+                             "K in [0,1] sets correction strength (default 1.0=full, 0=off).\n"
+                             "Use --cvd-type to select deutan (default) or protan.\n"
+                             "Example: --cvd  or  --cvd 0.7")
+    parser.add_argument("--cvd-type", default="deutan", choices=["deutan", "protan"],
+                        help="Type of red-green colour vision deficiency to correct for.\n"
+                             "deutan (default): deuteranopia/deuteranomaly (missing M cones, ~6%% of males).\n"
+                             "protan: protanopia/protanomaly (missing L cones, ~2%% of males).")
+
+    # --- Diagnostics ---
+    parser.add_argument("--diag", action="store_true",
+                        help="Write a diagnostic PDF with a*b* chrominance histograms\n"
+                             "for pixels with L* in [30, 80].")
+
+    # --- Lab output ---
+    parser.add_argument("--lab", action="store_true",
+                        help="Write a Lab-encoded TIFF (L*a*b* channels as uint16) instead of RGB.\n"
+                             "Output filename gets a '_lab.tif' suffix.")
 
     # --- Output ---
     parser.add_argument("--output", default="TILE[id].tif", help="Output file name")
@@ -153,6 +184,17 @@ def parse_arguments():
 
     args = parser.parse_args()
     args.UM = parse_um(args.UM)
+
+    # Parse --saturate: one value → same for a* and b*; two values → (sa, sb)
+    if len(args.saturate) == 1:
+        args.saturate_a = args.saturate[0]
+        args.saturate_b = args.saturate[0]
+    elif len(args.saturate) == 2:
+        args.saturate_a = args.saturate[0]
+        args.saturate_b = args.saturate[1]
+    else:
+        parser.error("--saturate takes 1 or 2 values")
+
     return args, parser
 
 
@@ -307,14 +349,17 @@ def rescale_and_blend(args, parser):
     """Load the four Euclid MER band images and blend them into the B, G, R,
     and L channels used by the downstream colour pipeline.
 
-    Band-to-channel mapping
-    -----------------------
-    B (blue)      : weighted blend of Y and I  (controlled by --fi)
-    G (green)     : J-band, or average of Y+J with --mergeYJ
+    Default band-to-channel mapping
+    --------------------------------
+    B (blue)      : I-band (VIS)
+    G (green)     : average of Y and J bands
     R (red)       : H-band
     L (luminance) : I-band with a small adaptive H contribution (--fr),
                     softened by an exponential weight that prevents bright
                     H-band sources from overwhelming faint VIS structure.
+
+    With --blendIY, the blue channel is a weighted blend of Y and I
+    (controlled by --fi), and green is J alone.
 
     The four FITS files are read in parallel to overlap I/O latency.
     Per-band flux scaling (--scales) is applied in-place via numexpr before
@@ -365,19 +410,18 @@ def rescale_and_blend(args, parser):
 
     repair_bad_pixels(y_data, j_data, h_data, i_data, args)
 
-    # B: Y + fi * I, normalised — blends NIR-Y with VIS for a blue-ish channel
+    # B (blue) and G (green) channel construction.
+    # Default: B = I (VIS), G = average(Y, J).  This enhances red contrast
+    # between J and H, and places VIS structure directly in the blue channel.
+    # With --blendIY: B = (Y + fi*I)/(1+fi), G = J.
     fi = args.fi
-    if args.mergeYJ:
-        B = i_data
-    else:
+    if args.blendIY:
         B = ne.evaluate("(y_data + i_data * fi) / (1.0 + fi)",
                         local_dict={'y_data': y_data, 'i_data': i_data, 'fi': fi})
-
-    # G: J-band alone, or average of Y+J with --mergeYJ
-    if args.mergeYJ:
-        G = ne.evaluate("(y_data + j_data) * 0.5", local_dict={'y_data': y_data, 'j_data': j_data})
-    else:
         G = j_data
+    else:
+        B = i_data
+        G = ne.evaluate("(y_data + j_data) * 0.5", local_dict={'y_data': y_data, 'j_data': j_data})
 
     # L: I-band with an adaptive H-band contribution.  The exponential weight
     #    exp(-0.2*|I|) tapers the H contribution in bright regions, preserving
@@ -459,32 +503,130 @@ def contrast_adjustment(L, args):
 #   1. Convert the blended B/G/R channels to CIELab.
 #   2. Replace the Lab L* channel with the separately computed luminance L,
 #      which carries finer VIS detail than the colour channels alone.
-#   3. Scale the a* and b* chrominance channels by args.saturate.
-#   4. Convert back to RGB.
+#   3. Scale the a* and b* chrominance channels by args.saturate_a and
+#      args.saturate_b respectively.
+#   4. CVD daltonization (if --cvd) is applied before the asinh stretch
+#      in main(), in linear flux space.
+#   5. Optionally write a diagnostic a*b* histogram (--diag).
+#   6. Convert back to RGB, or write Lab-encoded TIFF if --lab is set.
 #
 # The OpenCV path is ~5× faster because cv2.cvtColor uses a look-up table
-# for the gamma power law, among others; the manual path is kept for 
+# for the gamma power law, among others; the manual path is kept for
 # reference and as a low-dependency fallback.
 # ---------------------------------------------------------------------------
 
+def _apply_cvd_daltonize(B, G, R, k, cvd_type, bw_min, bw_max):
+    """Apply Fidaner+2005 daltonization in linear flux space (before arcsinh stretch).
+
+    The algorithm simulates what a dichromat sees, computes the error relative
+    to the original, and redistributes that error onto the channels the
+    observer can still perceive (Fidaner, Lin & Ozguven 2005):
+
+        out = original + E * (original - simulation)
+            = (I + E * (I - S)) * original  =:  D * original
+
+    where S is the Vienot+1999 simulation matrix and E the error
+    redistribution matrix. The combined matrix D is precomputed for efficiency.
+
+    Simulation matrices S (Vienot+1999, linear sRGB):
+        S_p: row0=[0.10889, 0.89111, 0], row1=[0.10889, 0.89111, 0], row2=[0.00447,-0.00447,1]
+        S_d: row0=[0.29031, 0.70969, 0], row1=[0.29031, 0.70969, 0], row2=[-0.02197,0.02197,1]
+
+    Error redistribution matrices E (Fidaner 2005, ixora.io):
+        E_p: row0=[0,0,0], row1=[0.7,1,0], row2=[0.7,0,1]
+        E_d: row0=[1,0.7,0], row1=[0,0,0], row2=[0,0.7,1]
+
+    Combined matrices D = I + E*(I-S):
+        D_p = [[1.00000,  0.00000, 0.00000],
+               [0.51489,  0.48511, 0.00000],
+               [0.61931, -0.61931, 1.00000]]
+
+        D_d = [[ 1.50647, -0.50647, 0.00000],
+               [ 0.00000,  1.00000, 0.00000],
+               [-0.18125,  0.18125, 1.00000]]
+
+    White maps to white for both. Out-of-range values are clipped to [0,1].
+    k in [0,1] interpolates: D(k) = (1-k)*I + k*D_full.
+    B (blue/Y-band), G (green/J-band), R (red/H-band) modified in-place.
+    bw_min, bw_max: black and white flux reference points (args.blackwhite)
+    used to normalise each channel to [0,1] before the matrix and back.
+    """
+    scale = float(bw_max - bw_min)
+    if scale == 0.0:
+        return
+    k = float(np.clip(k, 0.0, 1.0))
+    if k == 0.0:
+        return
+
+    # Normalise each channel to [0,1] using the blackwhite reference points
+    ne.evaluate("(B - bw_min) / scale", local_dict={"B": B, "bw_min": bw_min, "scale": scale}, out=B)
+    ne.evaluate("(G - bw_min) / scale", local_dict={"G": G, "bw_min": bw_min, "scale": scale}, out=G)
+    ne.evaluate("(R - bw_min) / scale", local_dict={"R": R, "bw_min": bw_min, "scale": scale}, out=R)
+
+    if cvd_type == "deutan":
+        # D_d interpolated by k:
+        # R' = (1 + k*0.50647)*R - k*0.50647*G
+        # G' = G  (unchanged)
+        # B' = B - k*0.18125*R + k*0.18125*G
+        a = k * 0.50647
+        b = k * 0.18125
+        R_new = ne.evaluate("(1.0 + a)*R - a*G", local_dict={"R": R, "G": G, "a": a})
+        B_new = ne.evaluate("B - b*R + b*G", local_dict={"B": B, "R": R, "G": G, "b": b})
+        R[:] = R_new
+        B[:] = B_new
+        # G is unchanged
+
+    else:  # protan
+        # D_p interpolated by k:
+        # R' = R  (unchanged)
+        # G' = k*0.51489*R + (1 - k*0.51489)*G
+        # B' = B + k*0.61931*R - k*0.61931*G
+        a = k * 0.51489
+        b = k * 0.61931
+        G_new = ne.evaluate("a*R + (1.0 - a)*G", local_dict={"R": R, "G": G, "a": a})
+        B_new = ne.evaluate("B + b*R - b*G", local_dict={"B": B, "R": R, "G": G, "b": b})
+        G[:] = G_new
+        B[:] = B_new
+        # R is unchanged
+
+    # Restore original scale
+    ne.evaluate("B * scale + bw_min", local_dict={"B": B, "scale": scale, "bw_min": bw_min}, out=B)
+    ne.evaluate("G * scale + bw_min", local_dict={"G": G, "scale": scale, "bw_min": bw_min}, out=G)
+    ne.evaluate("R * scale + bw_min", local_dict={"R": R, "scale": scale, "bw_min": bw_min}, out=R)
+
+
+
 def rgb_lab_rgb_OpenCV(rgb, L, args):
-    """Luminance swap and saturation boost via OpenCV's CIELab conversion."""
+    """Luminance swap and saturation boost via OpenCV's CIELab conversion.
+    With --lab, returns the Lab array instead of converting back to RGB."""
     print("Color-space operations")
 
     # RGB → Lab (OpenCV uses float32 input in range [0, 1])
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab)
     rgb = None; gc.collect()
 
-    # Scale a* and b* chrominance channels in-place, clamped to valid Lab range
-    s = args.saturate
-    for i in [1, 2]:
-        ch_view = lab[:, :, i]
-        ne.evaluate("where(ch*s > 127, 127, where(ch*s < -128, -128, ch*s))",
-                    local_dict={'ch': ch_view, 's': s}, out=ch_view)
+    # Scale a* and b* chrominance channels independently, clamped to valid range
+    sa = args.saturate_a
+    sb = args.saturate_b
+    a_view = lab[:, :, 1]
+    b_view = lab[:, :, 2]
+    ne.evaluate("where(ch*s > 127, 127, where(ch*s < -128, -128, ch*s))",
+                local_dict={'ch': a_view, 's': sa}, out=a_view)
+    ne.evaluate("where(ch*s > 127, 127, where(ch*s < -128, -128, ch*s))",
+                local_dict={'ch': b_view, 's': sb}, out=b_view)
+
+    # CVD daltonization is applied upstream in linear flux space (see main())
+
+    # Diagnostic: histogram of a* and b* for mid-lightness pixels
+    if args.diag:
+        plot_ab_histogram(lab[:, :, 0], lab[:, :, 1], lab[:, :, 2], args)
 
     # Replace the L* channel (range 0–100) with the pre-computed luminance
     ne.evaluate("L * 100.0", local_dict={'L': L}, out=lab[:, :, 0])
     L = None; gc.collect()
+
+    if args.lab:
+        return lab
 
     rgb = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
     lab = None
@@ -495,7 +637,8 @@ def rgb_lab_rgb_OpenCV(rgb, L, args):
 
 def rgb_lab_rgb_manual(rgb, L, args):
     """Luminance swap and saturation boost via a fully manual CIELab pipeline.
-    Slower than the OpenCV version (~5×) but has no OpenCV dependency."""
+    Slower than the OpenCV version (~5×) but has no OpenCV dependency.
+    With --lab, returns a Lab array (H×W×3 float32) instead of RGB."""
     print("Color-space operations")
 
     # --- RGB → Lab ---
@@ -532,15 +675,32 @@ def rgb_lab_rgb_manual(rgb, L, args):
     ne.evaluate("where(Z > eps, Z ** (1.0/3.0), kappa * Z + 0.137931)",
                 local_dict={'Z': Z, 'eps': eps, 'kappa': kappa}, out=Z)
 
-    # Step 5: Compute a* and b* chrominance, apply saturation, clamp to valid range
-    s = args.saturate
-    a_sat = ne.evaluate("500.0 * (X - Y) * s", local_dict={'X': X, 'Y': Y, 's': s})
-    b_sat = ne.evaluate("200.0 * (Y - Z) * s", local_dict={'Y': Y, 'Z': Z, 's': s})
+    # Step 5: Compute a* and b* chrominance with independent saturation, clamp
+    sa = args.saturate_a
+    sb = args.saturate_b
+    a_sat = ne.evaluate("500.0 * (X - Y) * sa", local_dict={'X': X, 'Y': Y, 'sa': sa})
+    b_sat = ne.evaluate("200.0 * (Y - Z) * sb", local_dict={'Y': Y, 'Z': Z, 'sb': sb})
     ne.evaluate("where(a_sat >  127,  127, where(a_sat < -128, -128, a_sat))", local_dict={'a_sat': a_sat}, out=a_sat)
     ne.evaluate("where(b_sat >  127,  127, where(b_sat < -128, -128, b_sat))", local_dict={'b_sat': b_sat}, out=b_sat)
 
+    # CVD daltonization is applied upstream in linear flux space (see main())
+
     # Use the passed-in luminance L instead of the computed L* channel
     light = ne.evaluate("L * 100.0", local_dict={'L': L})
+
+    # Diagnostic: histogram of a* and b* for mid-lightness pixels
+    if args.diag:
+        plot_ab_histogram(light, a_sat, b_sat, args)
+
+    # --lab: return Lab array directly without converting back to RGB
+    if args.lab:
+        lab = np.empty((light.shape[0], light.shape[1], 3), dtype=np.float32)
+        lab[:, :, 0] = light
+        lab[:, :, 1] = a_sat
+        lab[:, :, 2] = b_sat
+        X = Y = Z = light = a_sat = b_sat = None
+        gc.collect()
+        return lab
 
     # --- Lab → RGB ---
 
@@ -583,13 +743,18 @@ def rgb_lab_rgb_manual(rgb, L, args):
     return rgb
 
 
-def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09):
+def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09,
+                 clip_min=0.0, clip_max=1.0):
     """Sharpen image by subtracting a Gaussian-blurred version of itself.
 
     Only pixels where the local contrast (|image - blurred|) exceeds
     threshold are sharpened, which avoids amplifying noise in flat regions.
-    The result is clipped to [0, 1] in-place.  All operations are fused into
-    single numexpr passes to avoid intermediate allocations.
+    The result is clipped to [clip_min, clip_max] in-place.  For RGB images
+    the default [0, 1] range applies; for Lab channels, pass appropriate
+    bounds (e.g. [0, 100] for L*, [-128, 127] for a*/b*).
+
+    All operations are fused into single numexpr passes to avoid intermediate
+    allocations.
     """
     print(f"Unsharp masking with {radius, strength, threshold}")
     ksize = max(3, int(2*round(radius*2.5)+1))
@@ -599,8 +764,120 @@ def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09):
                 local_dict={'image': image, 'blurred': blurred, 'threshold': threshold, 'strength': strength},
                 out=image)
 
-    ne.evaluate("where(image > 1, 1, where(image < 0, 0, image))", out=image)
+    lo = clip_min
+    hi = clip_max
+    ne.evaluate("where(image > hi, hi, where(image < lo, lo, image))",
+                local_dict={'image': image, 'lo': lo, 'hi': hi}, out=image)
 
+def plot_ab_histogram(L_star, a_star, b_star, args):
+    """Append per-pixel a* and b* values into shared FITS accumulator files,
+    one file per L* luminosity bin, using flock-based locking for safe
+    parallel execution across multiple eummy instances.
+
+    The three bin files are written next to the calling script (or CWD):
+        ab_bin1.fits   L* in [28, 40)
+        ab_bin2.fits   L* in [40, 60)
+        ab_bin3.fits   L* in [60, 80]
+
+    Each file holds two columns: A_STAR and B_STAR (float32).
+    Rows are appended atomically; a lock file (<bin>.lock) serialises
+    concurrent writers so no data is lost.
+
+    When --diag is given without the accumulator files being present they
+    are created on first write.  The caller is responsible for running
+    plot_ab_combined.py once all tiles have been processed.
+    """
+    import fcntl
+    from astropy.io import fits as _fits
+    from astropy.table import Table, vstack
+
+    print("Accumulating a*b* pixel values into bin files")
+
+    bins = [
+        ((L_star >= 28) & (L_star < 40), "ab_bin1.fits"),
+        ((L_star >= 40) & (L_star < 60), "ab_bin2.fits"),
+        ((L_star >= 60) & (L_star <= 80), "ab_bin3.fits"),
+    ]
+
+    # Place accumulator files in the same directory as the output TIFF
+    # out_dir = args.path
+    out_dir = os.getcwd()
+
+    for mask, fname in bins:
+        a_vals = a_star[mask].astype(np.float32)
+        b_vals = b_star[mask].astype(np.float32)
+        if a_vals.size == 0:
+            continue
+
+        fits_path = os.path.join(out_dir, fname)
+        lock_path = fits_path + ".lock"
+
+        # Open (or create) the lock file and acquire an exclusive lock.
+        # The lock is held for the entire read-modify-write cycle.
+        with open(lock_path, 'w') as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                new_rows = Table({'A_STAR': a_vals, 'B_STAR': b_vals})
+
+                if os.path.exists(fits_path):
+                    with _fits.open(fits_path, memmap=False) as hdul:
+                        existing = Table(hdul[1].data)
+                    combined = vstack([existing, new_rows])
+                else:
+                    combined = new_rows
+
+                combined.write(fits_path, format='fits', overwrite=True)
+                print(f"  {fname}: {len(combined):,} rows total "
+                      f"(+{len(new_rows):,} from this tile)")
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+'''                
+def plot_ab_histogram(L_star, a_star, b_star, args):
+    """Plot a*b* chrominance histograms for pixels with L* in [30, 80].
+
+    Accepts the L*, a*, b* channels directly (2-D arrays, any dtype).
+    Writes a single-panel histogram to <TILE>_diag_ab.pdf.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    print("Computing a*b* diagnostic histograms")
+
+    # Select pixels in the mid-lightness range
+    mask1 = (L_star >= 28) & (L_star < 40)
+    mask2 = (L_star >= 40) & (L_star < 60)
+    mask3 = (L_star >= 60) & (L_star <= 80)
+    a_sel1 = a_star[mask1]
+    b_sel1 = b_star[mask1]
+    a_sel2 = a_star[mask2]
+    b_sel2 = b_star[mask2]
+    a_sel3 = a_star[mask3]
+    b_sel3 = b_star[mask3]
+
+    print(f"AB: {np.mean(a_sel1)} {np.mean(b_sel1)} {np.mean(a_sel2)} {np.mean(b_sel2)} {np.mean(a_sel3)} {np.mean(b_sel3)}")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bins = np.linspace(-128, 127, 256)
+    ax.hist(a_sel1, bins=bins, color='#ff9900', alpha=0.9, label='$a^*$ (green–red)',   density=True)
+    ax.hist(a_sel2, bins=bins, color='#ff5500', alpha=0.9, label='$a^*$ (green–red)',   density=True)
+    ax.hist(a_sel3, bins=bins, color='#ff0000', alpha=0.9, label='$a^*$ (green–red)',   density=True)
+    ax.hist(b_sel1, bins=bins, color='#0099ff', alpha=0.9, label='$b^*$ (blue–yellow)', density=True)
+    ax.hist(b_sel2, bins=bins, color='#0055ff', alpha=0.9, label='$b^*$ (blue–yellow)', density=True)
+    ax.hist(b_sel3, bins=bins, color='#0000ff', alpha=0.9, label='$b^*$ (blue–yellow)', density=True)
+    ax.set_xlabel('Chrominance value')
+    ax.set_ylabel('Normalised frequency')
+    ax.set_title(f'Chrominance distribution for $L^*\\in[28,\\,80]$')
+    ax.legend()
+    ax.set_xlim(-100, 100)
+
+    stem = os.path.splitext(args.output)[0]
+    pdf_path = os.path.join(args.path, f"{stem}_diag_ab.pdf")
+    fig.savefig(pdf_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Diagnostic plot saved: {pdf_path}")
+    a_sel = b_sel = None
+'''
 
 def colorise_L(B, G, R, L, wcs, args, parser):
     """Combine the four float32 channels into a colour image and write the TIFF.
@@ -608,12 +885,15 @@ def colorise_L(B, G, R, L, wcs, args, parser):
     The B, G, R channels carry chrominance information; L carries luminance.
     They are merged in CIELab space: chrominance comes from B/G/R, while the
     Lab L* channel is replaced by the separately blended luminance L.  This
-    preserves fine VIS detail in the brightness while the NIR bands provide
+    preserves fine VIS detail in the brightness while the NISP bands provide
     natural colour.
+
+    With --lab, the output is a Lab-encoded TIFF (L*a*b* as float32 channels)
+    instead of the usual sRGB TIFF.  The filename gets a '_lab.tif' suffix.
 
     Peak RAM here is approximately:
       ~5.6 GB for the four input channels (19200×19200 float32)
-      + ~3.7 GB for the interleaved rgb array
+      + ~3.7 GB for the interleaved rgb/lab array
       + temporary XYZ arrays in the manual Lab path (~11 GB peak total)
     The input channels are freed as they are consumed into rgb.
     """
@@ -626,27 +906,55 @@ def colorise_L(B, G, R, L, wcs, args, parser):
     gc.collect()
 
     if args.useOpenCV:
-        rgb = rgb_lab_rgb_OpenCV(rgb, L, args)
+        result = rgb_lab_rgb_OpenCV(rgb, L, args)
     else:
-        rgb = rgb_lab_rgb_manual(rgb, L, args)
+        result = rgb_lab_rgb_manual(rgb, L, args)
     L = None
     gc.collect()
 
-    if args.UM is not None:
-        fwhm, strength, threshold = args.UM
-        unsharp_mask(rgb, fwhm, strength, threshold)
+    if args.lab:
+        # result is an H×W×3 float32 Lab array; write it directly as a TIFF.
+        # L* is in [0,100], a* and b* in [-128,127].  We store as float32
+        # to preserve the full Lab range without quantisation.
+        stem = os.path.splitext(args.output)[0]
+        args.output = stem + "_lab.tif"
 
-    # Scale float32 [0,1] → uint16 [0,65535] and flip vertically so that
-    # north is up in the output (FITS row 0 is at the bottom; the flip puts
-    # it at the end of the file, which is the top in image-viewer convention).
-    rgb_out = np.empty(rgb.shape, dtype=np.uint16)
-    np.multiply(rgb[::-1], 65535, out=rgb_out, casting='unsafe')
-    rgb = None
-    gc.collect()
+        if args.UM is not None:
+            fwhm, strength, threshold = args.UM
+            # Sharpen each Lab channel with its own valid range.
+            # The threshold is in channel units; scale it for L* ([0,100])
+            # and a*/b* ([-128,127]) relative to the RGB [0,1] default.
+            unsharp_mask(result[:, :, 0:1], fwhm, strength, threshold * 100.0,
+                         clip_min=0.0, clip_max=100.0)
+            unsharp_mask(result[:, :, 1:2], fwhm, strength, threshold * 127.0,
+                         clip_min=-128.0, clip_max=127.0)
+            unsharp_mask(result[:, :, 2:3], fwhm, strength, threshold * 127.0,
+                         clip_min=-128.0, clip_max=127.0)
 
-    write_output(rgb_out, wcs, args)
-    rgb_out = None
-    gc.collect()
+        # Flip vertically for north-up convention
+        lab_out = result[::-1].copy()
+        result = None
+        gc.collect()
+
+        write_output(lab_out, wcs, args)
+        lab_out = None
+        gc.collect()
+    else:
+        if args.UM is not None:
+            fwhm, strength, threshold = args.UM
+            unsharp_mask(result, fwhm, strength, threshold)
+
+        # Scale float32 [0,1] → uint16 [0,65535] and flip vertically so that
+        # north is up in the output (FITS row 0 is at the bottom; the flip puts
+        # it at the end of the file, which is the top in image-viewer convention).
+        rgb_out = np.empty(result.shape, dtype=np.uint16)
+        np.multiply(result[::-1], 65535, out=rgb_out, casting='unsafe')
+        result = None
+        gc.collect()
+
+        write_output(rgb_out, wcs, args)
+        rgb_out = None
+        gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1364,12 @@ def main():
     cv2.setNumThreads(args.nthreads)
 
     B, G, R, L, wcs, fits_path = rescale_and_blend(args, parser)
+
+    # CVD daltonization in linear flux space, before any nonlinear compression
+    if args.cvd is not None:
+        print(f"Applying {args.cvd_type} daltonization (k={args.cvd:.2f})")
+        _apply_cvd_daltonize(B, G, R, args.cvd, args.cvd_type, args.blackwhite[0], args.blackwhite[1])
+
     asinh_scale_and_normalise(B, G, R, L, args)
     contrast_adjustment(L, args)
 

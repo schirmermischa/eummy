@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eummy"
-version = "1.3.1"
+version = "1.3.2"
 authors = [
   { name="Mischa Schirmer", email="schirmer@mpia.de" },
 ]
 description = "Create color images from Euclid MER stacks"
 readme = "README.md"
 requires-python = ">=3.7"
-license = {text = "GPL-3.0-or-later"}
+license = {text = "MIT License"}
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Astronomy",
     "Intended Audience :: Science/Research",
