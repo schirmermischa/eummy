@@ -285,13 +285,13 @@ def check_zeropoints(i_band, y_band, j_band, h_band, args):
 
         with fits.open(fpath) as hdul:
             hdr = hdul[0].header
-            for kw in ('MAGZERO', 'MAGZP', 'ZP_STACK'):
+            for kw in ('MAGZERO', 'MAGZP', 'ZP_STACK', 'ZPAB'):
                 if kw in hdr:
                     zp_measured = float(hdr[kw])
                     break
 
         if zp_measured is None:
-            print(f"  {band}: no MAGZERO/MAGZP/ZP_STACK keyword found "
+            print(f"  {band}: no MAGZERO/MAGZP/ZP_STACK/ZPAB keyword found "
                   f"— keeping default scale {scale_map[band]:.6f}")
             continue
 
