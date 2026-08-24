@@ -25,15 +25,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import sys, os, glob, argparse, cv2, gc, re, tifffile
+import sys, os, glob, argparse, cv2, gc, re, tifffile, warnings
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 import numpy as np
 import numexpr as ne
+from scipy.optimize import curve_fit
 from importlib.metadata import version, PackageNotFoundError
 from concurrent.futures import ThreadPoolExecutor
+
+# astropy.wcs emits FITSFixedWarning whenever it silently normalises a
+# non-standard but unambiguous header value (e.g. deriving DATE-OBS from
+# MJD-OBS). This is informational, not actionable, and fires on essentially
+# every WCS() call in this script — suppressed globally rather than at each
+# of the several call sites.
+warnings.filterwarnings('ignore', category=FITSFixedWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +121,14 @@ def parse_arguments():
                         help="Blend I and Y into blue channel (B = (Y + fi*I)/(1+fi)), with J as green.\n"
                              "Default mode uses I for blue and average(Y,J) for green.")
     parser.add_argument("--fi", type=float, default=1.6, help="I-blending fraction for B channel (only with --blendIY)")
+    parser.add_argument("--subtract_back", action="store_true",
+                        help="Estimate and subtract a constant background from each band.\n"
+                             "Background is estimated from a 5%% random pixel subsample: median\n"
+                             "and MAD are computed, pixels beyond +/-1.486*MAD of the median are\n"
+                             "rejected, and a Gaussian (sigma fixed to 1.486*MAD) is fit to the\n"
+                             "histogram of the surviving pixels. The fitted mean is subtracted.\n"
+                             "Applied immediately after reading each FITS file, before plate-scale\n"
+                             "resampling and flux scaling.")
 
     # --- Colour and image quality ---
     parser.add_argument("--saturate", nargs="+", type=float, default=[2.0],
@@ -231,15 +247,222 @@ def find_images_in_directory(path, parser):
     return vis_images[0], nir_y_images[0], nir_j_images[0], nir_h_images[0], tileID
 
 
-def extract_wcs(fits_path):
-    """Read the linear WCS keywords from the primary HDU header of fits_path
-    and return them as a plain dict.  The CD-matrix formalism is used
-    (CD1_1 … CD2_2), which encodes pixel scale, orientation, and shear."""
+def check_zeropoints(i_band, y_band, j_band, h_band, args):
+    """Read MAGZERO (or MAGZP) from each FITS header and compare to the
+    reference zeropoints for which the default --scales values are calibrated:
+
+        VIS (I): 24.5   Y: 30.1   J: 29.8   H: 30.0
+
+    If the measured zeropoint differs from the reference, the corresponding
+    scale factor is corrected by 10^((zp_measured - zp_ref) / 2.5) so that
+    all bands remain on a common J-band flux reference regardless of pipeline
+    zeropoint variations between data releases.
+
+    If no zeropoint keyword is found in a header, a warning is printed and
+    the default scale is kept unchanged.
+    """
+    ZP_REF = {'I': 24.5, 'Y': 30.1, 'J': 29.8, 'H': 30.0}
+
+    def abs_path(f):
+        return f if os.path.isabs(f) else os.path.join(args.path, f)
+
+    bands = [
+        ('I', abs_path(i_band)),
+        ('Y', abs_path(y_band)),
+        ('J', abs_path(j_band)),
+        ('H', abs_path(h_band)),
+    ]
+
+    si, sy, sj, sh = args.scales
+    scale_map = {'I': si, 'Y': sy, 'J': sj, 'H': sh}
+
+    print("Checking photometric zero points")
+    any_correction = False
+
+    for band, fpath in bands:
+        zp_ref = ZP_REF[band]
+        zp_measured = None
+
+        with fits.open(fpath) as hdul:
+            hdr = hdul[0].header
+            for kw in ('MAGZERO', 'MAGZP', 'ZP_STACK'):
+                if kw in hdr:
+                    zp_measured = float(hdr[kw])
+                    break
+
+        if zp_measured is None:
+            print(f"  {band}: no MAGZERO/MAGZP/ZP_STACK keyword found "
+                  f"— keeping default scale {scale_map[band]:.6f}")
+            continue
+
+        delta = zp_measured - zp_ref
+        if abs(delta) > 0.01:
+            correction = 10.0 ** (delta / 2.5)
+            scale_corrected = scale_map[band] * correction
+            print(f"  {band}: MAGZERO={zp_measured:.4f} (ref={zp_ref:.1f}) "
+                  f"→ correction={correction:.6f}× "
+                  f"({scale_map[band]:.6f} → {scale_corrected:.6f})")
+            scale_map[band] = scale_corrected
+            any_correction = True
+        else:
+            print(f"  {band}: MAGZERO={zp_measured:.4f} ≈ ref={zp_ref:.1f} "
+                  f"— no correction needed")
+
+    if not any_correction:
+        print("  All zero points consistent with defaults.")
+
+    args.scales = [scale_map['I'], scale_map['Y'], scale_map['J'], scale_map['H']]
+
+
+def estimate_background(data, band_name):
+    """Estimate a robust constant background level for a single band.
+
+    A 5% random subsample of pixels is drawn (without replacement) from the
+    finite (non-NaN, non-inf) pixels only — real Euclid MER tiles have NaN
+    no-data borders on partial-coverage tiles, and including those in the
+    sample would propagate NaN through median/MAD/histogram silently
+    (np.median does not skip NaN). Filtering first, rather than sampling
+    then dropping NaNs, also keeps the sample size close to the requested
+    5% regardless of how large the no-data border is.
+
+    The median and MAD (median absolute deviation) of the finite subsample
+    are computed, and pixels beyond +/- 1.486*MAD of the median are rejected
+    (1.486*MAD is the standard scale factor that makes the MAD a consistent
+    estimator of sigma for a Gaussian). A Gaussian is then fit to the
+    histogram of the surviving pixels, with sigma held fixed at 1.486*MAD
+    and only the amplitude and mean left free. The fitted mean is returned
+    as the background estimate.
+    """
+    flat = data.ravel()
+    finite = flat[np.isfinite(flat)]
+
+    if finite.size == 0:
+        print(f"  WARNING: {band_name}: no finite pixels found — "
+              f"skipping background subtraction (background=0.0)", flush=True)
+        return 0.0
+
+    rng = np.random.default_rng()
+    n_sample = max(1, int(0.05 * finite.size))
+    idx = rng.choice(finite.size, size=n_sample, replace=False)
+    sample = finite[idx]
+
+    median = np.median(sample)
+    mad = np.median(np.abs(sample - median))
+    sigma_robust = 1.486 * mad
+
+    clipped = sample[np.abs(sample - median) <= sigma_robust]
+
+    counts, edges = np.histogram(clipped, bins=50)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    def gauss_fixed_sigma(x, amp, mu):
+        return amp * np.exp(-0.5 * ((x - mu) / sigma_robust) ** 2)
+
+    try:
+        popt, _ = curve_fit(gauss_fixed_sigma, centers, counts,
+                             p0=[counts.max(), median])
+        background = popt[1]
+    except RuntimeError:
+        print(f"  WARNING: {band_name}: Gaussian fit did not converge — "
+              f"falling back to clipped median", flush=True)
+        background = median
+
+    print(f"  {band_name}: background = {background:.6f}", flush=True)
+    return background
+
+
+def get_plate_scale(fits_path):
+    """Return the pixel scale of fits_path in arcsec/pixel, read from its WCS.
+
+    Uses astropy.wcs.WCS.proj_plane_pixel_scales(), which handles both the
+    CD-matrix and CDELT+PC formalisms transparently. Returns the mean of the
+    x/y pixel scales; warns if they differ by more than 0.1% (non-square
+    pixels), which would indicate a distorted or unusual WCS.
+    """
     with fits.open(fits_path) as hdul:
         header = hdul[0].header
+        wcs = WCS(header)
+    scales_arcsec = [s.to(u.arcsec).value for s in wcs.proj_plane_pixel_scales()]
+    if abs(scales_arcsec[0] - scales_arcsec[1]) / scales_arcsec[0] > 1e-3:
+        print(f"  WARNING: non-square pixels in {os.path.basename(fits_path)}: "
+              f"{scales_arcsec[0]:.5f}\" x {scales_arcsec[1]:.5f}\" — using mean")
+    return float(np.mean(scales_arcsec))
+
+
+def resample_to_reference(data, zoom_factor, target_shape, band_name):
+    """Flux-conservingly resample data (float32) onto target_shape using
+    bilinear interpolation.
+
+    Uses cv2.resize (INTER_LINEAR) rather than scipy.ndimage.zoom: both
+    perform the same bilinear interpolation, but cv2's SIMD/multi-threaded
+    implementation runs roughly 2x faster in practice. Resizing directly to
+    target_shape (rather than by an approximate zoom factor) also means the
+    output shape is exact by construction, with no rounding correction
+    needed.
+
+    Bilinear resampling interpolates surface brightness (the value at each
+    output pixel), not flux: the number of pixels covering any fixed
+    angular aperture changes by zoom_factor**2 (the ratio of plate scales
+    squared), so the raw pixel sum over that aperture would scale by
+    zoom_factor**2 too. Dividing by zoom_factor**2 conserves flux, i.e.
+    summing counts in a fixed aperture gives the same result before and
+    after resampling.
+
+    NaN pixels (no-data borders, cosmic rays, detector gaps) are handled
+    separately from the interpolation itself. Bilinear interpolation does
+    not skip NaN inputs — any output pixel whose kernel touches one becomes
+    NaN too, so a single bad input pixel "bleeds" into a zoom_factor-sized
+    patch of output pixels, and no-data borders grow. To avoid this, NaNs
+    are filled with a placeholder before interpolating the data values, and
+    the NaN footprint itself is resampled separately with nearest-neighbour
+    interpolation (which reproduces each input pixel's classification
+    exactly, without blending) to determine which output pixels should be
+    NaN.
+    """
+    print(f"  Resampling {band_name} onto I-band grid "
+          f"(factor {zoom_factor:.4f}x, bilinear)...", flush=True)
+
+    dsize = (target_shape[1], target_shape[0])
+    nan_mask_in = np.isnan(data)
+
+    if nan_mask_in.any():
+        finite_fill = np.nan_to_num(data, nan=0.0)
+        resampled = cv2.resize(finite_fill, dsize, interpolation=cv2.INTER_LINEAR)
+        resampled = resampled.astype(np.float32, copy=False)
+
+        mask_resampled = cv2.resize(nan_mask_in.astype(np.uint8), dsize,
+                                     interpolation=cv2.INTER_NEAREST)
+        resampled[mask_resampled.astype(bool)] = np.nan
+    else:
+        resampled = cv2.resize(data, dsize, interpolation=cv2.INTER_LINEAR)
+        resampled = resampled.astype(np.float32, copy=False)
+
+    resampled /= np.float32(zoom_factor ** 2)
+    return resampled
+
+
+def extract_wcs(fits_path):
+    """Read the WCS of fits_path and return it as a plain dict, in the
+    CD-matrix formalism (CD1_1 ... CD2_2), which encodes pixel scale,
+    orientation, and shear in a single linear transform.
+
+    Uses astropy.wcs.WCS.pixel_scale_matrix rather than reading CD1_1...
+    CD2_2 directly from the header: many pipelines express the same
+    linear WCS via CDELT1/2 + PC1_1... instead of an explicit CD matrix,
+    and reading the CD keywords directly would silently return None for
+    such headers, producing a TIFF with broken WCS metadata. Both
+    formalisms are numerically equivalent for a linear WCS (no SIP
+    distortion), so normalising through the WCS object handles either.
+    """
+    with fits.open(fits_path) as hdul:
+        header = hdul[0].header
+        w = WCS(header)
+        cd = w.pixel_scale_matrix
         wcs = {k: header.get(k) for k in ['EQUINOX', 'RADESYS', 'CTYPE1', 'CTYPE2',
                                            'CUNIT1', 'CUNIT2', 'CRVAL1', 'CRVAL2',
-                                           'CRPIX1', 'CRPIX2', 'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2']}
+                                           'CRPIX1', 'CRPIX2']}
+        wcs['CD1_1'], wcs['CD1_2'] = float(cd[0, 0]), float(cd[0, 1])
+        wcs['CD2_1'], wcs['CD2_2'] = float(cd[1, 0]), float(cd[1, 1])
     return wcs
 
 
@@ -297,9 +520,24 @@ def repair_bad_pixels(B, G, R, L, args):
        value (1e5) so that it renders as white rather than black after the
        arcsinh stretch.
     """
-    print("Repairing bad pixels")
+    print("Repairing bad pixels", flush=True)
 
     mask = np.empty(L.shape, dtype=bool)
+
+    # 0. Identify NaN pixels (no-data border regions in partial-coverage tiles).
+    #    NaN propagates silently through all arithmetic and produces undefined
+    #    uint16 values on cast.  We mark NaN locations with a negative sentinel
+    #    (-1e10) that survives the pipeline, then zero those pixels at the end
+    #    so they render as black (true no-data) rather than white (saturated).
+    #    This is distinct from zero pixels inside the data area (saturated star
+    #    cores, detector gaps) which should remain white per step 4 below.
+    SENTINEL = np.float32(-1e10)
+    nan_mask = np.empty(L.shape, dtype=bool)
+    ne.evaluate("(B != B) | (G != G) | (R != R) | (L != L)",
+                local_dict={'B': B, 'G': G, 'R': R, 'L': L}, out=nan_mask)
+    for ch in (B, G, R, L):
+        ne.evaluate("where(ch != ch, SENTINEL, ch)",
+                    local_dict={'ch': ch, 'SENTINEL': SENTINEL}, out=ch)
 
     # 1. Bad NISP: any NIR band zero while VIS is valid → use VIS luminance
     ne.evaluate("((B==0) | (G==0) | (R==0)) & (L!=0)", out=mask)
@@ -343,6 +581,14 @@ def repair_bad_pixels(B, G, R, L, args):
     B[mask] = 1e5
     G[mask] = 1e5
     R[mask] = 1e5
+    L[mask] = 1e5
+
+    # 5. Zero out original NaN pixels (no-data border) so they render as black.
+    #    Done last so step 4 does not turn them white.
+    B[nan_mask] = 0.0
+    G[nan_mask] = 0.0
+    R[nan_mask] = 0.0
+    L[nan_mask] = 0.0
 
 
 def rescale_and_blend(args, parser):
@@ -382,24 +628,83 @@ def rescale_and_blend(args, parser):
     if args.output == "TILE[id].tif":
         args.output = tileID
 
+    # Check FITS header zeropoints and correct scales if needed
+    check_zeropoints(i_band, y_band, j_band, h_band, args)
+
     si, sy, sj, sh = args.scales
 
-    print("Processing FITS images")
+    files_abs = {
+        'I': i_band if os.path.isabs(i_band) else os.path.join(args.path, i_band),
+        'Y': y_band if os.path.isabs(y_band) else os.path.join(args.path, y_band),
+        'J': j_band if os.path.isabs(j_band) else os.path.join(args.path, j_band),
+        'H': h_band if os.path.isabs(h_band) else os.path.join(args.path, h_band),
+    }
 
-    def load_and_prep(file_path):
+    # Determine each band's plate scale from its WCS. The I-band (VIS) is
+    # always the reference resolution; Y/J/H are flux-conservingly resampled
+    # onto the I-band pixel grid below if their plate scale differs from it
+    # by more than 0.1%. Silent unless a band actually needs resampling.
+    plate_scales = {band: get_plate_scale(path) for band, path in files_abs.items()}
+    ps_i = plate_scales['I']
+    zoom_factors = {'I': 1.0}
+    for band in ('Y', 'J', 'H'):
+        ratio = plate_scales[band] / ps_i
+        if abs(ratio - 1.0) > 1e-3:
+            zoom_factors[band] = ratio
+            print(f"  {band}: {plate_scales[band]:.5f}\"/px vs I: {ps_i:.5f}\"/px "
+                  f"→ resampling by factor {ratio:.6f}")
+        else:
+            zoom_factors[band] = 1.0
+
+    print("Processing FITS images", flush=True)
+
+    def load_raw(band):
         # astropy.io.fits preserves FITS row order (row 0 = bottom of sky).
         # np.asanyarray returns a view when the data is already float32.
-        with fits.open(file_path) as hdul:
+        with fits.open(files_abs[band]) as hdul:
             data = hdul[0].data
             return np.asanyarray(data, dtype=np.float32)
 
     # Read all four bands in parallel to overlap disk latency
-    files = [f if os.path.isabs(f) else os.path.join(args.path, f) for f in [y_band, j_band, h_band, i_band]]
     with ThreadPoolExecutor(max_workers=4) as executor:
-        y_data, j_data, h_data, i_data = list(executor.map(load_and_prep, files))
+        raw = dict(zip(['Y', 'J', 'H', 'I'], executor.map(load_raw, ['Y', 'J', 'H', 'I'])))
+
+    # Background subtraction: applied immediately after reading the FITS
+    # files, before plate-scale resampling and before flux scaling.
+    if args.subtract_back:
+        print("Estimating and subtracting background", flush=True)
+        for band in ('I', 'Y', 'J', 'H'):
+            bg = estimate_background(raw[band], band)
+            data = raw[band]
+            ne.evaluate("data - bg", local_dict={'data': data, 'bg': bg}, out=data)
+
+    i_data = raw['I']
+    target_shape = i_data.shape
+
+    # Resample Y/J/H onto the I-band grid where needed. Done after loading
+    # (so shapes are matched for the elementwise ops below) and before flux
+    # scaling (order doesn't matter — both are linear operations).
+    #
+    # Bands are resampled concurrently: cv2.resize releases the GIL during
+    # its C-level computation, so threading across bands can use multiple
+    # cores. Each call is given a reduced internal thread count to avoid
+    # oversubscribing the CPU (N concurrent calls x M threads each would
+    # otherwise compete for the same cores).
+    bands_to_resample = [b for b in ('Y', 'J', 'H') if zoom_factors[b] != 1.0]
+    if bands_to_resample:
+        threads_per_call = max(1, args.nthreads // len(bands_to_resample))
+        cv2.setNumThreads(threads_per_call)
+        with ThreadPoolExecutor(max_workers=len(bands_to_resample)) as executor:
+            results = executor.map(
+                lambda b: resample_to_reference(raw[b], zoom_factors[b], target_shape, b),
+                bands_to_resample)
+            raw.update(zip(bands_to_resample, results))
+        cv2.setNumThreads(args.nthreads)
+
+    y_data, j_data, h_data = raw['Y'], raw['J'], raw['H']
 
     # Extract and store WCS from the VIS (I) band header for use in output
-    fits_i_path = i_band if os.path.isabs(i_band) else os.path.join(args.path, i_band)
+    fits_i_path = files_abs['I']
     wcs = extract_wcs(fits_i_path)
 
     # Apply per-band flux scaling in-place (skip bands where scale == 1.0)
@@ -831,53 +1136,6 @@ def plot_ab_histogram(L_star, a_star, b_star, args):
                       f"(+{len(new_rows):,} from this tile)")
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
-'''                
-def plot_ab_histogram(L_star, a_star, b_star, args):
-    """Plot a*b* chrominance histograms for pixels with L* in [30, 80].
-
-    Accepts the L*, a*, b* channels directly (2-D arrays, any dtype).
-    Writes a single-panel histogram to <TILE>_diag_ab.pdf.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    print("Computing a*b* diagnostic histograms")
-
-    # Select pixels in the mid-lightness range
-    mask1 = (L_star >= 28) & (L_star < 40)
-    mask2 = (L_star >= 40) & (L_star < 60)
-    mask3 = (L_star >= 60) & (L_star <= 80)
-    a_sel1 = a_star[mask1]
-    b_sel1 = b_star[mask1]
-    a_sel2 = a_star[mask2]
-    b_sel2 = b_star[mask2]
-    a_sel3 = a_star[mask3]
-    b_sel3 = b_star[mask3]
-
-    print(f"AB: {np.mean(a_sel1)} {np.mean(b_sel1)} {np.mean(a_sel2)} {np.mean(b_sel2)} {np.mean(a_sel3)} {np.mean(b_sel3)}")
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bins = np.linspace(-128, 127, 256)
-    ax.hist(a_sel1, bins=bins, color='#ff9900', alpha=0.9, label='$a^*$ (green–red)',   density=True)
-    ax.hist(a_sel2, bins=bins, color='#ff5500', alpha=0.9, label='$a^*$ (green–red)',   density=True)
-    ax.hist(a_sel3, bins=bins, color='#ff0000', alpha=0.9, label='$a^*$ (green–red)',   density=True)
-    ax.hist(b_sel1, bins=bins, color='#0099ff', alpha=0.9, label='$b^*$ (blue–yellow)', density=True)
-    ax.hist(b_sel2, bins=bins, color='#0055ff', alpha=0.9, label='$b^*$ (blue–yellow)', density=True)
-    ax.hist(b_sel3, bins=bins, color='#0000ff', alpha=0.9, label='$b^*$ (blue–yellow)', density=True)
-    ax.set_xlabel('Chrominance value')
-    ax.set_ylabel('Normalised frequency')
-    ax.set_title(f'Chrominance distribution for $L^*\\in[28,\\,80]$')
-    ax.legend()
-    ax.set_xlim(-100, 100)
-
-    stem = os.path.splitext(args.output)[0]
-    pdf_path = os.path.join(args.path, f"{stem}_diag_ab.pdf")
-    fig.savefig(pdf_path, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Diagnostic plot saved: {pdf_path}")
-    a_sel = b_sel = None
-'''
 
 def colorise_L(B, G, R, L, wcs, args, parser):
     """Combine the four float32 channels into a colour image and write the TIFF.
