@@ -139,6 +139,220 @@ def repair_bad_pixels(B, G, R, L, args):
 
     Four repair passes are applied in sequence:
 
+    1. Bad NISP pixels (zero or NaN in any NIR band): replaced with the VIS
+       luminance value L so the pixel contributes greyscale rather than a
+       colour artefact.
+    2. Bad VIS pixels (L == 0 or NaN while all NIR bands are valid): replaced
+       with the mean of the three NIR channels.
+    3. Hot pixels (automatic, EWS only): pixels that are both absolutely
+       bright and anomalously bright relative to the other channels are
+       replaced with the local cross-channel average.
+    4. Any pixel still zero in any channel after the above is set to a large
+       value (1e5) so that it renders as white rather than black in the final
+       image.
+
+    Pixels where all four channels are NaN are treated as no-data and are
+    rendered black at the end. Pixels where only one or more channels are
+    NaN are repaired using the other channels.
+    """
+    print("Repairing bad pixels")
+
+    mask = np.empty(L.shape, dtype=bool)
+
+    # 0. Identify NaN pixels.
+    #
+    # Pixels where ALL four channels are NaN are genuine no-data regions
+    # (typically outside the detector area) and are rendered black at the end.
+    #
+    # Pixels where only some channels are NaN are treated as bad pixels and
+    # can therefore be repaired in passes 1 and 2.
+    nan_B = np.empty(L.shape, dtype=bool)
+    nan_G = np.empty(L.shape, dtype=bool)
+    nan_R = np.empty(L.shape, dtype=bool)
+    nan_L = np.empty(L.shape, dtype=bool)
+
+    ne.evaluate("B != B", local_dict={'B': B}, out=nan_B)
+    ne.evaluate("G != G", local_dict={'G': G}, out=nan_G)
+    ne.evaluate("R != R", local_dict={'R': R}, out=nan_R)
+    ne.evaluate("L != L", local_dict={'L': L}, out=nan_L)
+
+    # Only pixels where all four channels are NaN are considered true
+    # no-data pixels and protected from the repair passes.
+    nan_mask = np.empty(L.shape, dtype=bool)
+    ne.evaluate(
+        "nan_B & nan_G & nan_R & nan_L",
+        local_dict={
+            'nan_B': nan_B,
+            'nan_G': nan_G,
+            'nan_R': nan_R,
+            'nan_L': nan_L
+        },
+        out=nan_mask
+    )
+
+    # Replace NaNs with a sentinel so that all-NaN pixels survive the zero
+    # checks below, while partially-NaN pixels can be explicitly identified
+    # and repaired using the masks above.
+    SENTINEL = np.float32(-1e10)
+
+    for ch in (B, G, R, L):
+        ne.evaluate(
+            "where(ch != ch, SENTINEL, ch)",
+            local_dict={'ch': ch, 'SENTINEL': SENTINEL},
+            out=ch
+        )
+
+    # 1. Bad NISP: any NIR band is zero or NaN while VIS is valid.
+    #
+    # The NaN masks are from the original data, before NaNs were replaced
+    # with the sentinel.
+    ne.evaluate(
+        "((B==0) | nan_B | (G==0) | nan_G | (R==0) | nan_R) "
+        "& (L!=0) & ~nan_L",
+        local_dict={
+            'B': B,
+            'G': G,
+            'R': R,
+            'L': L,
+            'nan_B': nan_B,
+            'nan_G': nan_G,
+            'nan_R': nan_R,
+            'nan_L': nan_L
+        },
+        out=mask
+    )
+
+    ne.evaluate("where(mask, L, B)", out=B)
+    ne.evaluate("where(mask, L, G)", out=G)
+    ne.evaluate("where(mask, L, R)", out=R)
+
+    # 2. Bad VIS: L is zero or NaN while all NIR bands are valid.
+    #
+    # The NIR channels must be nonzero and must not originally have been NaN.
+    avg_nir = "(B + G + R) / 3.0"
+
+    ne.evaluate(
+        "where("
+        "    ((L==0) | nan_L) "
+        "    & (B!=0) & ~nan_B "
+        "    & (G!=0) & ~nan_G "
+        "    & (R!=0) & ~nan_R, "
+        f"    {avg_nir}, "
+        "    L"
+        ")",
+        local_dict={
+            'B': B,
+            'G': G,
+            'R': R,
+            'L': L,
+            'nan_B': nan_B,
+            'nan_G': nan_G,
+            'nan_R': nan_R,
+            'nan_L': nan_L
+        },
+        out=L
+    )
+
+    # 3. Hot pixel masking — applied automatically to large (EWS) images or
+    #    when explicitly requested. Pixels are flagged as hot if they exceed
+    #    an absolute threshold AND are more than thresh2× brighter than the
+    #    cross-channel average; replaced by that average.
+    height, width = L.shape
+
+    if (height > 15000 and width > 15000 and args.mask is not False) or args.mask is True:
+
+        # thresh4 is high for VIS because the compact PSF produces genuinely
+        # bright single-pixel star cores that should not be masked.
+        thresh1, thresh2, thresh3, thresh4 = 5, 5, 3, 20
+
+        ne.evaluate(
+            "(B > th1) & (B > th2 * (G+R+L)/3)",
+            local_dict={
+                'B': B,
+                'G': G,
+                'R': R,
+                'L': L,
+                'th1': thresh1,
+                'th2': thresh2
+            },
+            out=mask
+        )
+        ne.evaluate("where(mask, (G+R+L)/3, B)", out=B)
+
+        ne.evaluate(
+            "(G > th1) & (G > th2 * (B+R+L)/3)",
+            local_dict={
+                'B': B,
+                'G': G,
+                'R': R,
+                'L': L,
+                'th1': thresh1,
+                'th2': thresh2
+            },
+            out=mask
+        )
+        ne.evaluate("where(mask, (B+R+L)/3, G)", out=G)
+
+        ne.evaluate(
+            "(R > th1) & (R > th2 * (B+G+L)/3)",
+            local_dict={
+                'B': B,
+                'G': G,
+                'R': R,
+                'L': L,
+                'th1': thresh1,
+                'th2': thresh2
+            },
+            out=mask
+        )
+        ne.evaluate("where(mask, (B+G+L)/3, R)", out=R)
+
+        ne.evaluate(
+            "(L > th3) & (L > th4 * (B+G+R)/3)",
+            local_dict={
+                'B': B,
+                'G': G,
+                'R': R,
+                'L': L,
+                'th3': thresh3,
+                'th4': thresh4
+            },
+            out=mask
+        )
+        ne.evaluate("where(mask, (B+G+R)/3, L)", out=L)
+
+    # 4. Any remaining zero in any channel → set to white (saturated).
+    #
+    # Original all-NaN pixels contain SENTINEL values and therefore do not
+    # trigger this test.
+    ne.evaluate(
+        "(B==0) | (G==0) | (R==0) | (L==0)",
+        out=mask
+    )
+
+    B[mask] = 1e5
+    G[mask] = 1e5
+    R[mask] = 1e5
+    L[mask] = 1e5
+
+    # 5. Restore original all-NaN pixels as black/no-data.
+    #
+    # This happens after step 4 so genuine zero pixels (e.g. saturated stars
+    # or detector gaps) remain white, while only pixels that were NaN in ALL
+    # four channels become black.
+    B[nan_mask] = 0.0
+    G[nan_mask] = 0.0
+    R[nan_mask] = 0.0
+    L[nan_mask] = 0.0
+
+    return nan_mask
+
+# unused
+def repair_bad_pixels_aggressiveNaN(B, G, R, L, args):
+    """Replace missing and anomalous pixel values before colour composition.
+
+    Four repair passes are applied in sequence:
+
     1. Bad NISP pixels (zero in any NIR band): replaced with the VIS
        luminance value L so the pixel contributes greyscale rather than a
        colour artefact.
