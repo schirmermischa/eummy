@@ -12,7 +12,8 @@ You can install **eummy** directly from PyPI using pip, pip3, or pipx:
 pipx install eummy
 ```
 
-Note: This will automatically install required dependencies including numpy, astropy, opencv-python, tifffile, scikit-image, scipy, and numexpr.
+Note: This will automatically install required dependencies: numpy, astropy,
+opencv-python, tifffile, numexpr, and scipy.
 
 ## Usage
 

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eummy"
-version = "1.4.1"
+version = "1.5.0"
 authors = [
   { name="Mischa Schirmer", email="schirmer@mpia.de" },
 ]
 description = "Create color images from Euclid MER stacks"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 license = {text = "MIT License"}
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -25,7 +25,7 @@ dependencies = [
     "opencv-python",
     "tifffile",
     "numexpr",
-    "psutil",
+    "scipy",
 ]
 
 [project.urls]
