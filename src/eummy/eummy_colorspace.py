@@ -127,7 +127,11 @@ def render_lab_pipeline(B, G, R, L, args, nan_mask=None):
     X = ne.evaluate("0.4124564*r + 0.3575761*g + 0.1804375*b")
     Y = ne.evaluate("0.2126729*r + 0.7151522*g + 0.0721750*b")
     Z = ne.evaluate("0.0193339*r + 0.1191920*g + 0.9503041*b")
-    rgb = None; gc.collect()
+    # r, g, b are VIEWS into rgb (not copies) -- rgb=None alone does NOT
+    # free rgb's buffer while these views are still live locals; clearing
+    # them too is what actually releases it here rather than only once r/g/b
+    # get reassigned to the final RGB output much later in this function.
+    rgb = None; r = g = b = None; gc.collect()
 
     # --- XYZ → Lab (f_CIE, no gamma) ---
     Xn, Yn, Zn = 0.95047, 1.00000, 1.08883
@@ -457,6 +461,7 @@ def process_cutouts(B, G, R, L, cutout_specs, fits_path, wcs, args, nan_mask=Non
             cutout_wcs['CRPIX1'] = wcs['CRPIX1'] - col_start
         if cutout_wcs.get('CRPIX2') is not None:
             cutout_wcs['CRPIX2'] = wcs['CRPIX2'] - row_start
+        cutout_wcs['COMMAND'] = args.command
 
         fname    = _cutout_filename(args.output, ra_deg, dec_deg)
         out_path = os.path.join(args.path, fname)
