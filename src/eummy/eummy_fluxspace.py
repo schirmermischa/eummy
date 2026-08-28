@@ -20,7 +20,8 @@ from scipy.optimize import curve_fit
 from concurrent.futures import ThreadPoolExecutor
 
 from .eummy_io import (check_zeropoints, get_plate_scale, extract_wcs,
-                        extract_tileID, find_images_in_directory, get_science_hdu)
+                        extract_tileID, find_images_in_directory, get_science_hdu,
+                        read_zeropoint)
 
 
 def estimate_background(data, band_name):
@@ -134,230 +135,16 @@ def resample_to_reference(data, zoom_factor, target_shape, band_name):
 # Bad-pixel repair and channel blending
 # ---------------------------------------------------------------------------
 
-def repair_bad_pixels(B, G, R, L, args):
+def repair_bad_pixels(B, G, R, L, args, thresh_scale=1.0):
     """Replace missing and anomalous pixel values before colour composition.
 
     Four repair passes are applied in sequence:
 
-    1. Bad NISP pixels (zero or NaN in any NIR band): replaced with the VIS
+    1. Bad NISP pixels (zero OR NaN in any NIR band): replaced with the VIS
        luminance value L so the pixel contributes greyscale rather than a
        colour artefact.
-    2. Bad VIS pixels (L == 0 or NaN while all NIR bands are valid): replaced
-       with the mean of the three NIR channels.
-    3. Hot pixels (automatic, EWS only): pixels that are both absolutely
-       bright and anomalously bright relative to the other channels are
-       replaced with the local cross-channel average.
-    4. Any pixel still zero in any channel after the above is set to a large
-       value (1e5) so that it renders as white rather than black in the final
-       image.
-
-    Pixels where all four channels are NaN are treated as no-data and are
-    rendered black at the end. Pixels where only one or more channels are
-    NaN are repaired using the other channels.
-    """
-    print("Repairing bad pixels")
-
-    mask = np.empty(L.shape, dtype=bool)
-
-    # 0. Identify NaN pixels.
-    #
-    # Pixels where ALL four channels are NaN are genuine no-data regions
-    # (typically outside the detector area) and are rendered black at the end.
-    #
-    # Pixels where only some channels are NaN are treated as bad pixels and
-    # can therefore be repaired in passes 1 and 2.
-    nan_B = np.empty(L.shape, dtype=bool)
-    nan_G = np.empty(L.shape, dtype=bool)
-    nan_R = np.empty(L.shape, dtype=bool)
-    nan_L = np.empty(L.shape, dtype=bool)
-
-    ne.evaluate("B != B", local_dict={'B': B}, out=nan_B)
-    ne.evaluate("G != G", local_dict={'G': G}, out=nan_G)
-    ne.evaluate("R != R", local_dict={'R': R}, out=nan_R)
-    ne.evaluate("L != L", local_dict={'L': L}, out=nan_L)
-
-    # Only pixels where all four channels are NaN are considered true
-    # no-data pixels and protected from the repair passes.
-    nan_mask = np.empty(L.shape, dtype=bool)
-    ne.evaluate(
-        "nan_B & nan_G & nan_R & nan_L",
-        local_dict={
-            'nan_B': nan_B,
-            'nan_G': nan_G,
-            'nan_R': nan_R,
-            'nan_L': nan_L
-        },
-        out=nan_mask
-    )
-
-    # Replace NaNs with a sentinel so that all-NaN pixels survive the zero
-    # checks below, while partially-NaN pixels can be explicitly identified
-    # and repaired using the masks above.
-    SENTINEL = np.float32(-1e10)
-
-    for ch in (B, G, R, L):
-        ne.evaluate(
-            "where(ch != ch, SENTINEL, ch)",
-            local_dict={'ch': ch, 'SENTINEL': SENTINEL},
-            out=ch
-        )
-
-    # 1. Bad NISP: any NIR band is zero or NaN while VIS is valid.
-    #
-    # The NaN masks are from the original data, before NaNs were replaced
-    # with the sentinel.
-    ne.evaluate(
-        "((B==0) | nan_B | (G==0) | nan_G | (R==0) | nan_R) "
-        "& (L!=0) & ~nan_L",
-        local_dict={
-            'B': B,
-            'G': G,
-            'R': R,
-            'L': L,
-            'nan_B': nan_B,
-            'nan_G': nan_G,
-            'nan_R': nan_R,
-            'nan_L': nan_L
-        },
-        out=mask
-    )
-
-    ne.evaluate("where(mask, L, B)", out=B)
-    ne.evaluate("where(mask, L, G)", out=G)
-    ne.evaluate("where(mask, L, R)", out=R)
-
-    # 2. Bad VIS: L is zero or NaN while all NIR bands are valid.
-    #
-    # The NIR channels must be nonzero and must not originally have been NaN.
-    avg_nir = "(B + G + R) / 3.0"
-
-    ne.evaluate(
-        "where("
-        "    ((L==0) | nan_L) "
-        "    & (B!=0) & ~nan_B "
-        "    & (G!=0) & ~nan_G "
-        "    & (R!=0) & ~nan_R, "
-        f"    {avg_nir}, "
-        "    L"
-        ")",
-        local_dict={
-            'B': B,
-            'G': G,
-            'R': R,
-            'L': L,
-            'nan_B': nan_B,
-            'nan_G': nan_G,
-            'nan_R': nan_R,
-            'nan_L': nan_L
-        },
-        out=L
-    )
-
-    # 3. Hot pixel masking — applied automatically to large (EWS) images or
-    #    when explicitly requested. Pixels are flagged as hot if they exceed
-    #    an absolute threshold AND are more than thresh2× brighter than the
-    #    cross-channel average; replaced by that average.
-    height, width = L.shape
-
-    if (height > 15000 and width > 15000 and args.mask is not False) or args.mask is True:
-
-        # thresh4 is high for VIS because the compact PSF produces genuinely
-        # bright single-pixel star cores that should not be masked.
-        thresh1, thresh2, thresh3, thresh4 = 5, 5, 3, 20
-
-        ne.evaluate(
-            "(B > th1) & (B > th2 * (G+R+L)/3)",
-            local_dict={
-                'B': B,
-                'G': G,
-                'R': R,
-                'L': L,
-                'th1': thresh1,
-                'th2': thresh2
-            },
-            out=mask
-        )
-        ne.evaluate("where(mask, (G+R+L)/3, B)", out=B)
-
-        ne.evaluate(
-            "(G > th1) & (G > th2 * (B+R+L)/3)",
-            local_dict={
-                'B': B,
-                'G': G,
-                'R': R,
-                'L': L,
-                'th1': thresh1,
-                'th2': thresh2
-            },
-            out=mask
-        )
-        ne.evaluate("where(mask, (B+R+L)/3, G)", out=G)
-
-        ne.evaluate(
-            "(R > th1) & (R > th2 * (B+G+L)/3)",
-            local_dict={
-                'B': B,
-                'G': G,
-                'R': R,
-                'L': L,
-                'th1': thresh1,
-                'th2': thresh2
-            },
-            out=mask
-        )
-        ne.evaluate("where(mask, (B+G+L)/3, R)", out=R)
-
-        ne.evaluate(
-            "(L > th3) & (L > th4 * (B+G+R)/3)",
-            local_dict={
-                'B': B,
-                'G': G,
-                'R': R,
-                'L': L,
-                'th3': thresh3,
-                'th4': thresh4
-            },
-            out=mask
-        )
-        ne.evaluate("where(mask, (B+G+R)/3, L)", out=L)
-
-    # 4. Any remaining zero in any channel → set to white (saturated).
-    #
-    # Original all-NaN pixels contain SENTINEL values and therefore do not
-    # trigger this test.
-    ne.evaluate(
-        "(B==0) | (G==0) | (R==0) | (L==0)",
-        out=mask
-    )
-
-    B[mask] = 1e5
-    G[mask] = 1e5
-    R[mask] = 1e5
-    L[mask] = 1e5
-
-    # 5. Restore original all-NaN pixels as black/no-data.
-    #
-    # This happens after step 4 so genuine zero pixels (e.g. saturated stars
-    # or detector gaps) remain white, while only pixels that were NaN in ALL
-    # four channels become black.
-    B[nan_mask] = 0.0
-    G[nan_mask] = 0.0
-    R[nan_mask] = 0.0
-    L[nan_mask] = 0.0
-
-    return nan_mask
-
-# unused
-def repair_bad_pixels_aggressiveNaN(B, G, R, L, args):
-    """Replace missing and anomalous pixel values before colour composition.
-
-    Four repair passes are applied in sequence:
-
-    1. Bad NISP pixels (zero in any NIR band): replaced with the VIS
-       luminance value L so the pixel contributes greyscale rather than a
-       colour artefact.
-    2. Bad VIS pixels (L == 0 while all NIR bands are valid): replaced with
-       the mean of the three NIR channels.
+    2. Bad VIS pixels (L zero OR NaN while all NIR bands are valid):
+       replaced with the mean of the three NIR channels.
     3. Hot pixels (automatic, EWS only): pixels that are both absolutely
        bright and anomalously bright relative to their neighbours across
        channels are replaced with the local cross-channel average.  The VIS
@@ -365,23 +152,44 @@ def repair_bad_pixels_aggressiveNaN(B, G, R, L, args):
     4. Any pixel still zero in any channel after the above is set to a large
        value (1e5) so that it renders as white rather than black in the
        final image.
+
+    NaN is treated as equivalent to zero throughout steps 1-4: a pixel that
+    is NaN in only one (or a few, but not all four) channels is repaired by
+    borrowing from the valid channels exactly as a genuine zero pixel would
+    be -- a single-band NaN (e.g. a cosmic-ray gap in one NIR band) should
+    not blank out three otherwise-good channels. Only a pixel that is NaN
+    in ALL FOUR channels (true no-data -- outside the survey footprint in
+    every band) is rendered as black; see step 5.
+
+    thresh_scale rescales the two *absolute* flux thresholds (thresh1,
+    thresh3) to match the actual data, combining two independent
+    corrections computed in rescale_and_blend and multiplied together:
+      - zeropoint: only when --no-zp-check, tracking the J-band zeropoint's
+        deviation from the reference (30.1) as 10**((zp_measured-30.1)/2.5).
+      - plate scale: always, tracking the I-band's plate scale deviation
+        from the nominal 0.1"/pixel Euclid MER convention as
+        (plate_scale/0.1)**2 (flux-per-pixel scales with pixel area).
+    The two *ratio* thresholds (thresh2, thresh4) are NOT rescaled by
+    either: they compare a channel to a scaled average of the other
+    channels, which are already on the same flux scale, so that ratio is
+    scale-invariant by construction -- rescaling it would be wrong, not
+    just unnecessary.
     """
     print("Repairing bad pixels")
 
     mask = np.empty(L.shape, dtype=bool)
 
-    # 0. Identify NaN pixels (no-data border regions in partial-coverage tiles).
-    #    Replace with sentinel −1e10 so they survive the pipeline without
-    #    triggering the zero checks in steps 1-4.  After step 4 has turned
-    #    genuine zero pixels (saturated stars, detector gaps) white, the NaN
-    #    pixels are zeroed so they render as black (true no-data).
-    SENTINEL = np.float32(-1e10)
+    # 0. Identify true no-data pixels: NaN in ALL FOUR channels (not just
+    #    any one -- a pixel that's NaN in only some channels is repaired by
+    #    borrowing from the valid ones in steps 1-2 below, same as a
+    #    genuine zero pixel). Individual NaN values are replaced with plain
+    #    0.0 so the existing zero-checks in steps 1-4 treat them exactly
+    #    like a genuine bad/zero pixel -- no special-casing needed there.
     nan_mask = np.empty(L.shape, dtype=bool)
-    ne.evaluate("(B != B) | (G != G) | (R != R) | (L != L)",
+    ne.evaluate("(B != B) & (G != G) & (R != R) & (L != L)",
                 local_dict={'B': B, 'G': G, 'R': R, 'L': L}, out=nan_mask)
     for ch in (B, G, R, L):
-        ne.evaluate("where(ch != ch, SENTINEL, ch)",
-                    local_dict={'ch': ch, 'SENTINEL': SENTINEL}, out=ch)
+        ne.evaluate("where(ch != ch, 0.0, ch)", local_dict={'ch': ch}, out=ch)
 
     # 1. Bad NISP: any NIR band zero while VIS is valid → use VIS luminance
     ne.evaluate("((B==0) | (G==0) | (R==0)) & (L!=0)", out=mask)
@@ -402,7 +210,10 @@ def repair_bad_pixels_aggressiveNaN(B, G, R, L, args):
 
         # thresh4 is high for VIS because the compact PSF produces genuinely
         # bright single-pixel star cores that should not be masked.
-        thresh1, thresh2, thresh3, thresh4 = 5, 5, 3, 20
+        # thresh1/thresh3 (absolute) are scaled by thresh_scale to track the
+        # data's actual photometric zeropoint; thresh2/thresh4 (ratios) are
+        # not, since they're already scale-invariant -- see docstring.
+        thresh1, thresh2, thresh3, thresh4 = 5 * thresh_scale, 5, 3 * thresh_scale, 20
 
         ne.evaluate("(B > th1) & (B > th2 * (G+R+L)/3)",
                     local_dict={'B': B, 'G': G, 'R': R, 'L': L, 'th1': thresh1, 'th2': thresh2}, out=mask)
@@ -427,8 +238,10 @@ def repair_bad_pixels_aggressiveNaN(B, G, R, L, args):
     R[mask] = 1e5
     L[mask] = 1e5
 
-    # 5. Zero out original NaN pixels so they render as black.
-    #    Done after step 4 so saturated-star zeros are already white.
+    # 5. Zero out true no-data pixels (NaN in all four channels -- see step 0)
+    #    so they render as black. Done after step 4 so any genuinely
+    #    saturated/zero pixels are already white; only nan_mask pixels get
+    #    overridden back to black here.
     B[nan_mask] = 0.0
     G[nan_mask] = 0.0
     R[nan_mask] = 0.0
@@ -492,18 +305,71 @@ def rescale_and_blend(args, parser):
     # Determine each band's plate scale from its WCS. The I-band (VIS) is
     # always the reference resolution; Y/J/H are flux-conservingly resampled
     # onto the I-band pixel grid below if their plate scale differs from it
-    # by more than 0.1%. Silent unless a band actually needs resampling.
+    # by more than 0.1% (relative, band-vs-band check). Separately, if the
+    # I-band's own plate scale deviates from the nominal 0.1"/pixel Euclid
+    # MER convention, --blackwhite/--pivot are corrected for that (absolute,
+    # vs-nominal check) -- see below. Silent unless a correction is needed.
+    #
+    # get_plate_scale() returns None (with its own warning already printed)
+    # if a band's header has no valid celestial WCS. If that's the I-band
+    # itself, there is no reference to compare anything against, so plate-
+    # scale checking is skipped entirely for all bands (assume no resampling
+    # needed anywhere, and no --blackwhite/--pivot correction is possible).
+    # If it's a non-reference band, that band alone is assumed to match the
+    # reference (no resampling for it specifically).
     plate_scales = {band: get_plate_scale(path) for band, path in files_abs.items()}
     ps_i = plate_scales['I']
     zoom_factors = {'I': 1.0}
-    for band in ('Y', 'J', 'H'):
-        ratio = plate_scales[band] / ps_i
-        if abs(ratio - 1.0) > 1e-3:
-            zoom_factors[band] = ratio
-            print(f"  {band}: {plate_scales[band]:.5f}\"/px vs I: {ps_i:.5f}\"/px "
-                  f"→ resampling by factor {ratio:.6f}")
-        else:
-            zoom_factors[band] = 1.0
+    plate_scale_factor = 1.0  # default: no correction possible/needed
+    if ps_i is None:
+        print("  WARNING: I-band has no valid celestial WCS — skipping plate-scale "
+              "checking for all bands (assuming no resampling is needed anywhere).")
+        zoom_factors.update({'Y': 1.0, 'J': 1.0, 'H': 1.0})
+    else:
+        for band in ('Y', 'J', 'H'):
+            if plate_scales[band] is None:
+                zoom_factors[band] = 1.0
+                continue
+            ratio = plate_scales[band] / ps_i
+            if abs(ratio - 1.0) > 1e-3:
+                zoom_factors[band] = ratio
+                print(f"  {band}: {plate_scales[band]:.5f}\"/px vs I: {ps_i:.5f}\"/px "
+                      f"→ resampling by factor {ratio:.6f}")
+            else:
+                zoom_factors[band] = 1.0
+
+        # --blackwhite and --pivot's default values (and any values you pass
+        # explicitly) are calibrated for flux-per-pixel at the nominal
+        # Euclid MER plate scale (0.1"/pixel). Flux-per-pixel for a fixed
+        # surface-brightness source scales with pixel AREA, i.e. with
+        # plate_scale**2 -- e.g. at 0.3"/pixel (3x coarser), each pixel
+        # covers 9x the sky area and so collects ~9x the flux for the same
+        # underlying brightness. This is a purely geometric effect,
+        # independent of and in addition to any photometric zero-point
+        # correction (check_zeropoints), and the relative Y/J/H-vs-I
+        # resampling above does NOT correct for it either -- that only
+        # detects mismatches *between* the four bands, not an absolute
+        # deviation from the nominal 0.1"/pixel convention shared by all
+        # of them. So it's corrected here explicitly: --blackwhite (in
+        # flux units) is scaled up by that same factor, and --pivot
+        # (defined via 1/pivot in flux units) is scaled down by it, so
+        # both stay pointed at the same physical brightness levels
+        # regardless of the data's actual plate scale. This same
+        # plate_scale_factor is also applied to repair_bad_pixels' absolute
+        # hot-pixel thresholds further down -- the raw pixel DATA itself is
+        # never corrected for this (unlike a zeropoint mismatch, nothing
+        # here re-scales the actual flux values when all four bands share
+        # the same non-nominal plate scale), so that correction must happen
+        # unconditionally, not just when --no-zp-check is given.
+        NOMINAL_PLATE_SCALE = 0.1
+        plate_scale_factor = (ps_i / NOMINAL_PLATE_SCALE) ** 2
+        if abs(plate_scale_factor - 1.0) > 1e-3:
+            args.blackwhite = [v * plate_scale_factor for v in args.blackwhite]
+            args.pivot = args.pivot / plate_scale_factor
+            print(f"  I-band plate scale {ps_i:.5f}\"/px (nominal {NOMINAL_PLATE_SCALE}\"/px) "
+                  f"→ scaling --blackwhite by {plate_scale_factor:.4f}× and "
+                  f"--pivot by {1.0/plate_scale_factor:.4f}× "
+                  f"(blackwhite={args.blackwhite}, pivot={args.pivot:.6f})")
 
     print("Processing FITS images", flush=True)
 
@@ -562,7 +428,42 @@ def rescale_and_blend(args, parser):
         if scale != 1.0:
             ne.evaluate("data / scale", local_dict={'data': data, 'scale': scale}, out=data)
 
-    nan_mask = repair_bad_pixels(y_data, j_data, h_data, i_data, args)
+    # repair_bad_pixels' absolute hot-pixel thresholds were calibrated for
+    # data at the reference J-band zeropoint (30.1). If check_zeropoints ran
+    # (the default), the flux-scaling step above already normalised every
+    # band's data to that same reference-equivalent scale regardless of its
+    # actual zeropoint (verified: with the correction applied, raw counts at
+    # any zeropoint divide down to the same common value, to within
+    # floating-point precision) -- so the thresholds are already correct as
+    # given and must NOT be rescaled again here, or the same zeropoint
+    # correction would be applied twice.
+    # Only with --no-zp-check does the data remain on its raw, zeropoint-
+    # dependent scale (--scales is used exactly as given, uncorrected), and
+    # only then do the thresholds actually need to track the J-band
+    # zeropoint's deviation from the reference to keep flagging the same
+    # *physical* hot-pixel level.
+    zp_thresh_scale = 1.0
+    if args.no_zp_check:
+        zp_j_measured = read_zeropoint(files_abs['J'])
+        if zp_j_measured is not None:
+            zp_thresh_scale = 10.0 ** ((zp_j_measured - 30.1) / 2.5)
+            if abs(zp_thresh_scale - 1.0) > 0.01:
+                print(f"  J-band zeropoint {zp_j_measured:.3f} (ref 30.1) — "
+                      f"scaling hot-pixel thresholds by {zp_thresh_scale:.4f}× (zeropoint)")
+
+    # Unlike the zeropoint case, plate_scale_factor applies unconditionally:
+    # nothing in the pipeline corrects the raw pixel DATA for an absolute
+    # plate-scale deviation from the 0.1"/pixel nominal (only --blackwhite/
+    # --pivot get corrected, above) -- so the same factor must also be
+    # applied here regardless of --no-zp-check.
+    if abs(plate_scale_factor - 1.0) > 1e-3:
+        print(f"  I-band plate scale {ps_i:.5f}\"/px — scaling hot-pixel "
+              f"thresholds by {plate_scale_factor:.4f}× (plate scale)")
+
+    thresh_scale = zp_thresh_scale * plate_scale_factor
+
+    nan_mask = repair_bad_pixels(y_data, j_data, h_data, i_data, args,
+                                  thresh_scale=thresh_scale)
 
     # B (blue) and G (green) channel construction.
     # Default: B = I (VIS), G = average(Y, J).  This enhances red contrast

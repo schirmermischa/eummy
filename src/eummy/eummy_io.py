@@ -8,7 +8,7 @@ parses configuration. Depended on by eummy_fluxspace.py and
 eummy_colorspace.py; has no dependency on either.
 """
 
-import sys, os, glob, argparse, re, gc, warnings
+import sys, os, glob, argparse, re, gc, shlex, warnings
 from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
 from astropy.coordinates import SkyCoord
@@ -80,7 +80,17 @@ def parse_arguments():
 
     # --- Black/white points ---
     parser.add_argument("--blackwhite", nargs=2, type=float, default=[-1.3, 7000],
-                        help="Min/max flux thresholds for normalisation to [0,1] (J-band reference)")
+                        help="Min/max flux thresholds for normalisation to [0,1].\n"
+                             "Applied AFTER photometric zero-point correction and flux scaling\n"
+                             "(--scales) -- i.e. in the common, zero-point-independent flux scale\n"
+                             "that check_zeropoints normalises every band onto (J-band reference,\n"
+                             "zp=30.1), not raw pixel counts. As long as zero-point correction is\n"
+                             "active (the default; not --no-zp-check), these values do NOT need to\n"
+                             "be recalibrated per image regardless of that image's actual zero-\n"
+                             "point -- that consistency is the whole point of the correction.\n"
+                             "With --no-zp-check, --scales is used exactly as given (uncorrected),\n"
+                             "so these values then act directly on scale-divided raw flux and may\n"
+                             "need per-image adjustment.")
 
     # --- Band scaling and blending ---
     # DR1 values
@@ -116,9 +126,11 @@ def parse_arguments():
 
     # --- Colour pipeline ---
     parser.add_argument("--pivot", type=float, default=0.15,
-                        help="Asinh pivot parameter in raw flux units.\n"
-                             "Same units as --blackwhite.  Controls the linear-to-log transition:\n"
-                             "at flux = 1/pivot the stretch transitions from linear to logarithmic.\n"
+                        help="Asinh pivot parameter, in the same units as --blackwhite -- i.e.\n"
+                             "the common, zero-point-independent flux scale after --scales\n"
+                             "correction, not raw pixel counts (see --blackwhite for why).\n"
+                             "Controls the linear-to-log transition: at flux = 1/pivot the\n"
+                             "stretch transitions from linear to logarithmic.\n"
                              "Smaller = stronger compression of faint features.\n"
                              "Default 0.15 (same as the previous eummy default).")
     parser.add_argument("--saturate", nargs="+", type=float, default=[2.0],
@@ -197,6 +209,12 @@ def parse_arguments():
     else:
         parser.error("--saturate takes 1 or 2 values")
 
+    # Reconstruct the invoked command line (shlex.join shell-quotes any
+    # argument containing spaces, e.g. sexagesimal --cutout coordinates or
+    # paths with spaces), so it can be embedded in the output TIFF metadata
+    # for provenance -- lets you later recover exactly how an image was made.
+    args.command = shlex.join(sys.argv)
+
     return args, parser
 
 # ---------------------------------------------------------------------------
@@ -213,22 +231,54 @@ def extract_tileID(filename):
     else:
         return "TILE.tif"
 
+# Filename pattern groups to try, in order, when auto-discovering the four
+# band images in a directory. Each group is (I, Y, J, H) glob patterns.
+# Different pipelines producing Euclid-style MER stacks use different
+# naming conventions; the first group is the original/standard Euclid MER
+# BGSUB-MOSAIC convention, the other two are alternate conventions seen
+# from other pipelines. Each pattern gets a trailing '*' before '.fits' if
+# it doesn't already end in one, so version tags, tile IDs, dates etc.
+# after the identifying substring don't prevent a match.
+_MER_NAMING_GROUPS = [
+    ("EUC_MER_BGSUB-MOSAIC-VIS*.fits",
+     "EUC_MER_BGSUB-MOSAIC-NIR-Y*.fits",
+     "EUC_MER_BGSUB-MOSAIC-NIR-J*.fits",
+     "EUC_MER_BGSUB-MOSAIC-NIR-H*.fits"),
+    ("EUC_VIS_LSB*.fits",
+     "EUC_NISP_Y_LSB*.fits",
+     "EUC_NISP_J_LSB*.fits",
+     "EUC_NISP_H_LSB*.fits"),
+    ("EUC_VIS_*STK*.fits",
+     "EUC_NIR_*STK_Y*.fits",
+     "EUC_NIR_*STK_J*.fits",
+     "EUC_NIR_*STK_H*.fits"),
+]
+
 def find_images_in_directory(path, parser):
     """Locate exactly one FITS file per band (VIS, NIR-Y, NIR-J, NIR-H) in
-    path using the standard Euclid MER BGSUB-MOSAIC naming convention.
-    Exits with an error if the count for any band is not exactly one."""
-    vis_images   = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-VIS*.fits"))
-    nir_y_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-NIR-Y*.fits"))
-    nir_j_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-NIR-J*.fits"))
-    nir_h_images = glob.glob(os.path.join(path, "EUC_MER_BGSUB-MOSAIC-NIR-H*.fits"))
+    path, trying each entry in _MER_NAMING_GROUPS in turn until one group
+    yields exactly one match for all four bands. Patterns from different
+    groups are never mixed within a single match -- if a group matches
+    some bands but not all four exactly once, the whole group is rejected
+    and the next one is tried, rather than combining partial matches from
+    different conventions.
+    Exits with an error if no group matches all four bands exactly once.
+    """
+    for i_pat, y_pat, j_pat, h_pat in _MER_NAMING_GROUPS:
+        vis_images   = glob.glob(os.path.join(path, i_pat))
+        nir_y_images = glob.glob(os.path.join(path, y_pat))
+        nir_j_images = glob.glob(os.path.join(path, j_pat))
+        nir_h_images = glob.glob(os.path.join(path, h_pat))
 
-    if len(vis_images) != 1 or len(nir_y_images) != 1 or len(nir_j_images) != 1 or len(nir_h_images) != 1:
-        print(f"Error: Expected exactly one image per band in {path}.\n")
-        parser.print_help()
-        sys.exit(1)
+        if (len(vis_images) == 1 and len(nir_y_images) == 1
+                and len(nir_j_images) == 1 and len(nir_h_images) == 1):
+            tileID = extract_tileID(vis_images[0])
+            return vis_images[0], nir_y_images[0], nir_j_images[0], nir_h_images[0], tileID
 
-    tileID = extract_tileID(vis_images[0])
-    return vis_images[0], nir_y_images[0], nir_j_images[0], nir_h_images[0], tileID
+    print(f"Error: Could not find exactly one image per band (VIS, NIR-Y, "
+          f"NIR-J, NIR-H) in {path} using any recognised naming convention.\n")
+    parser.print_help()
+    sys.exit(1)
 
 
 def get_science_hdu(hdul):
@@ -251,6 +301,33 @@ def get_science_hdu(hdul):
             return hdu
     raise ValueError("No HDU with image data found in FITS file")
 
+
+def read_zeropoint(fits_path):
+    """Read the photometric zeropoint from fits_path's header, checking
+    MAGZERO, MAGZP, ZP_STACK, ZPAB in that order (first one found wins).
+
+    Checks both the primary header and the science (data-bearing) HDU's
+    header, since real files fall into three cases: (1) the primary HDU
+    carries both the data and the zeropoint keyword; (2) the primary HDU
+    is empty of data but still carries the zeropoint (data lives in an
+    extension whose own header does not repeat it); (3) both the data and
+    the zeropoint live together in an extension, with a near-empty primary
+    HDU. Checking only the science HDU (as get_science_hdu alone would
+    give you) misses case 2; checking only the primary misses case 3.
+    The science HDU's header is checked first (matches get_plate_scale/
+    extract_wcs's convention of treating it as authoritative when both
+    are present); the primary header is consulted only as a fallback.
+
+    Returns None if none of these keywords are present in either header.
+    """
+    with fits.open(fits_path) as hdul:
+        science_hdr = get_science_hdu(hdul).header
+        primary_hdr = hdul[0].header
+        for hdr in (science_hdr, primary_hdr):
+            for kw in ('MAGZERO', 'MAGZP', 'ZP_STACK', 'ZPAB'):
+                if kw in hdr:
+                    return float(hdr[kw])
+    return None
 
 def check_zeropoints(i_band, y_band, j_band, h_band, args):
     """Read MAGZERO (or MAGZP, ZP_STACK, ZPAB) from each FITS header and
@@ -278,13 +355,7 @@ def check_zeropoints(i_band, y_band, j_band, h_band, args):
 
     for band, fpath in bands:
         zp_ref = ZP_REF[band]
-        zp_measured = None
-        with fits.open(fpath) as hdul:
-            hdr = get_science_hdu(hdul).header
-            for kw in ('MAGZERO', 'MAGZP', 'ZP_STACK', 'ZPAB'):
-                if kw in hdr:
-                    zp_measured = float(hdr[kw])
-                    break
+        zp_measured = read_zeropoint(fpath)
         if zp_measured is None:
             continue
         delta = zp_measured - zp_ref
@@ -301,10 +372,28 @@ def get_plate_scale(fits_path):
     CD-matrix and CDELT+PC formalisms transparently. Returns the mean of the
     x/y pixel scales; warns if they differ by more than 0.1% (non-square
     pixels), which would indicate a distorted or unusual WCS.
+
+    Returns None (with a warning) if the header has no valid celestial WCS
+    -- e.g. missing CTYPE1/CTYPE2, which some crop/repackage tools (SWarp,
+    custom fitscut-style utilities) silently drop or reset to a dummy
+    linear placeholder (CDELT=1, CRVAL=0). Without CTYPE, astropy cannot
+    tell the axes are angular, and proj_plane_pixel_scales() returns
+    dimensionless values that cannot be converted to arcsec -- this is
+    caught here rather than left to crash with an opaque UnitConversionError
+    deep in astropy's unit-conversion machinery.
     """
     with fits.open(fits_path) as hdul:
         header = get_science_hdu(hdul).header
         wcs = WCS(header)
+
+    if not wcs.has_celestial:
+        print(f"  WARNING: {os.path.basename(fits_path)} has no valid celestial WCS "
+              f"(missing or invalid CTYPE1/CTYPE2) — cannot determine its plate scale. "
+              f"This often means an upstream cropping/repackaging step stripped or "
+              f"reset the WCS. Proceeding as if this band's plate scale matches the "
+              f"reference (no resampling for this band) — verify this is correct.")
+        return None
+
     scales_arcsec = [s.to(u.arcsec).value for s in wcs.proj_plane_pixel_scales()]
     if abs(scales_arcsec[0] - scales_arcsec[1]) / scales_arcsec[0] > 1e-3:
         print(f"  WARNING: non-square pixels in {os.path.basename(fits_path)}: "
@@ -323,29 +412,43 @@ def extract_wcs(fits_path):
     such headers, producing a TIFF with broken WCS metadata. Both
     formalisms are numerically equivalent for a linear WCS (no SIP
     distortion), so normalising through the WCS object handles either.
+
+    If the header has no valid celestial WCS (missing/invalid CTYPE1/2 --
+    see get_plate_scale for common causes), the CD fields are returned as
+    None rather than whatever placeholder pixel_scale_matrix would compute
+    (e.g. a literal 1 deg/pixel from a CDELT=1 dummy header) -- embedding
+    that into the output TIFF would silently claim real, if nonsensical,
+    astrometry instead of plainly showing no WCS is available.
     """
     with fits.open(fits_path) as hdul:
         header = get_science_hdu(hdul).header
         w = WCS(header)
-        cd = w.pixel_scale_matrix
         wcs = {k: header.get(k) for k in ['EQUINOX', 'RADESYS', 'CTYPE1', 'CTYPE2',
                                            'CUNIT1', 'CUNIT2', 'CRVAL1', 'CRVAL2',
                                            'CRPIX1', 'CRPIX2']}
-        wcs['CD1_1'], wcs['CD1_2'] = float(cd[0, 0]), float(cd[0, 1])
-        wcs['CD2_1'], wcs['CD2_2'] = float(cd[1, 0]), float(cd[1, 1])
+        if w.has_celestial:
+            cd = w.pixel_scale_matrix
+            wcs['CD1_1'], wcs['CD1_2'] = float(cd[0, 0]), float(cd[0, 1])
+            wcs['CD2_1'], wcs['CD2_2'] = float(cd[1, 0]), float(cd[1, 1])
+        else:
+            wcs['CD1_1'] = wcs['CD1_2'] = wcs['CD2_1'] = wcs['CD2_2'] = None
     return wcs
 
 def write_output(rgb, wcs, args):
     """Write the final uint16 RGB image as an uncompressed TIFF with the
-    WCS metadata embedded, and update a 'link.tif' symlink to point to
+    WCS metadata (plus the invoked command line, under COMMAND, for
+    provenance) embedded, and update a 'link.tif' symlink to point to
     the new file (atomic replace to avoid a broken-link window)."""
     output_path = os.path.join(args.path, f"{args.output}")
+
+    metadata = dict(wcs)
+    metadata['COMMAND'] = args.command
 
     print(f"Writing result to {output_path}")
     tifffile.imwrite(
         output_path,
         rgb,
-        metadata=wcs,
+        metadata=metadata,
         compression=None
     )
 
