@@ -12,11 +12,12 @@ Depends on eummy_io (header reading during rescale_and_blend); has no
 dependency on eummy_colorspace.
 """
 
-import sys, os, gc, cv2
+import sys, os, gc, cv2, threading
 import numpy as np
 import numexpr as ne
 from astropy.io import fits
 from scipy.optimize import curve_fit
+from scipy.ndimage import distance_transform_edt
 from concurrent.futures import ThreadPoolExecutor
 
 from .eummy_io import (check_zeropoints, get_plate_scale, extract_wcs,
@@ -132,8 +133,131 @@ def resample_to_reference(data, zoom_factor, target_shape, band_name):
     return resampled
 
 # ---------------------------------------------------------------------------
+# Binned-mask helpers (shared by no-data detection and edge erosion)
+# ---------------------------------------------------------------------------
+
+def _row_stripes(n_rows, nthreads):
+    """Split range(n_rows) into ~nthreads contiguous (start, stop) stripes."""
+    n = max(1, min(nthreads, n_rows))
+    edges = np.linspace(0, n_rows, n + 1).astype(int)
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+
+
+def _bin_reduce(mask, BIN, reduce_all, nthreads):
+    """Reduce a full-resolution boolean mask to BIN x BIN cells.
+
+    reduce_all=True : cell is True iff ALL its pixels are True
+    reduce_all=False: cell is True iff ANY of its pixels is True
+
+    Cells at the right/bottom edge that extend beyond the image are reduced
+    over their existing pixels only (equivalent to padding with the neutral
+    element), so no padded full-size copy is ever made. Rows are processed
+    in parallel stripes of whole binned rows; numpy reductions release the
+    GIL, and each stripe writes a disjoint block of the output.
+    """
+    H, W = mask.shape
+    Hb = (H + BIN - 1) // BIN
+    Wb = (W + BIN - 1) // BIN
+    Wm = (W // BIN) * BIN                 # width covered by whole cells
+    op = np.logical_and.reduce if reduce_all else np.logical_or.reduce
+    out = np.empty((Hb, Wb), dtype=bool)
+
+    def work(b0, b1):
+        r0, r1 = b0 * BIN, min(b1 * BIN, H)
+        n_full = (r1 - r0) // BIN
+        parts = []
+        if n_full:                                       # view, no copy
+            parts.append(op(mask[r0:r0 + n_full * BIN].reshape(n_full, BIN, W), axis=1))
+        if r0 + n_full * BIN < r1:                       # partial last cell row
+            parts.append(op(mask[r0 + n_full * BIN:r1], axis=0)[None, :])
+        rows = parts[0] if len(parts) == 1 else np.vstack(parts)
+        if Wm:
+            out[b0:b1, :Wm // BIN] = op(rows[:, :Wm].reshape(b1 - b0, Wm // BIN, BIN), axis=2)
+        if Wm < W:                                       # partial last cell column
+            out[b0:b1, -1] = op(rows[:, Wm:], axis=1)
+
+    with ThreadPoolExecutor(max_workers=nthreads) as ex:
+        for f in [ex.submit(work, b0, b1) for b0, b1 in _row_stripes(Hb, nthreads)]:
+            f.result()
+    return out
+
+
+def _expand_combine(cells, BIN, full, combine, nthreads):
+    """Expand a binned mask to full resolution (nearest neighbour) and
+    combine it with the full-resolution mask `full` in the same pass:
+
+    combine='and': result = expanded & full
+    combine='or' : result = expanded | full
+
+    Returns (result, n_changed) where n_changed counts pixels in which
+    result differs from `full`. Expansion uses broadcast assignment of whole
+    BIN-row blocks instead of a fancy-index gather (np.ix_), and expansion,
+    combination and counting are fused per parallel row stripe, so each
+    full-size array is traversed once.
+    """
+    H, W = full.shape
+    Hb = cells.shape[0]
+    result = np.empty((H, W), dtype=bool)
+    counts = []
+    lock = threading.Lock()
+
+    def work(b0, b1):
+        r0, r1 = b0 * BIN, min(b1 * BIN, H)
+        # horizontal expansion on the small binned rows, cropped to W
+        rows = np.repeat(cells[b0:b1], BIN, axis=1)[:, :W]
+        n_full = (r1 - r0) // BIN
+        if n_full:
+            result[r0:r0 + n_full * BIN].reshape(n_full, BIN, W)[:] = rows[:n_full, None, :]
+        if r0 + n_full * BIN < r1:
+            result[r0 + n_full * BIN:r1] = rows[n_full]
+        blk, ref = result[r0:r1], full[r0:r1]
+        if combine == 'and':
+            np.logical_and(blk, ref, out=blk)
+        else:
+            np.logical_or(blk, ref, out=blk)
+        n = int(np.count_nonzero(blk)) - int(np.count_nonzero(ref))
+        with lock:
+            counts.append(abs(n))
+
+    with ThreadPoolExecutor(max_workers=nthreads) as ex:
+        for f in [ex.submit(work, b0, b1) for b0, b1 in _row_stripes(Hb, nthreads)]:
+            f.result()
+    return result, sum(counts)
+
+# ---------------------------------------------------------------------------
 # Bad-pixel repair and channel blending
 # ---------------------------------------------------------------------------
+
+def _large_regions(bad, min_area, nthreads, BIN=8):
+    """Return the pixels of `bad` that belong to a connected region of at
+    least `min_area` pixels (8-connectivity).
+
+    Used to tell zero-valued no-data areas (tile corners, strips -- large)
+    apart from saturated star cores (also zero in all bands, but only
+    ~5-20 px across), which must keep rendering white.
+
+    Labelling runs on a BIN x BIN binned mask (a cell is set if ANY of its
+    pixels is bad), avoiding a full-resolution int32 label array (~1.5 GB
+    for a 19200^2 tile). Region area is estimated as n_cells * BIN^2, which
+    overestimates the true area (partial cells count fully, and bad pixels
+    within ~BIN of each other merge): a 20 px core can count as up to
+    ~1000 px, so min_area should stay well above that. The returned mask is
+    ANDed with `bad`, so only genuinely bad pixels are ever flagged.
+    """
+    from scipy.ndimage import label
+
+    bad_b = _bin_reduce(bad, BIN, reduce_all=False, nthreads=nthreads)
+    labels, n = label(bad_b, structure=np.ones((3, 3), dtype=bool))
+    if n == 0:
+        return np.zeros_like(bad)
+    big = np.bincount(labels.ravel()) * (BIN * BIN) >= min_area
+    big[0] = False                                   # label 0 = background
+    if not big.any():
+        return np.zeros_like(bad)
+    big_b = big[labels]
+    labels = None
+    out, _ = _expand_combine(big_b, BIN, bad, 'and', nthreads)
+    return out
 
 def repair_bad_pixels(B, G, R, L, args, thresh_scale=1.0):
     """Replace missing and anomalous pixel values before colour composition.
@@ -159,7 +283,11 @@ def repair_bad_pixels(B, G, R, L, args, thresh_scale=1.0):
     be -- a single-band NaN (e.g. a cosmic-ray gap in one NIR band) should
     not blank out three otherwise-good channels. Only a pixel that is NaN
     in ALL FOUR channels (true no-data -- outside the survey footprint in
-    every band) is rendered as black; see step 5.
+    every band) is rendered as black; see step 5. Additionally, pixels that
+    are zero-or-NaN in all four channels (any mix) are rendered black if
+    they belong to a connected region of at least args.nodata_min_area
+    pixels -- no-data areas filled with zeros instead of NaN. Smaller such
+    blobs (saturated star cores) still render white via step 4.
 
     thresh_scale rescales the two *absolute* flux thresholds (thresh1,
     thresh3) to match the actual data, combining two independent
@@ -188,6 +316,27 @@ def repair_bad_pixels(B, G, R, L, args, thresh_scale=1.0):
     nan_mask = np.empty(L.shape, dtype=bool)
     ne.evaluate("(B != B) & (G != G) & (R != R) & (L != L)",
                 local_dict={'B': B, 'G': G, 'R': R, 'L': L}, out=nan_mask)
+
+    # 0b. No-data areas filled with zeros (or a mix of zeros and NaN) instead
+    #     of pure NaN: a pixel is "bad" if each of the four bands is zero or
+    #     NaN. Such pixels also occur in saturated star cores, which must keep
+    #     rendering white (step 4), so only bad pixels in LARGE connected
+    #     regions (>= --nodata-min-area) are treated as no-data. Pure all-NaN
+    #     pixels stay no-data regardless of size (unchanged behaviour).
+    #     Must run before the NaN -> 0 replacement below.
+    if args.nodata_min_area > 0:
+        ne.evaluate("((B != B) | (B == 0)) & ((G != G) | (G == 0)) & "
+                    "((R != R) | (R == 0)) & ((L != L) | (L == 0))",
+                    local_dict={'B': B, 'G': G, 'R': R, 'L': L}, out=mask)
+        if mask.any():
+            large = _large_regions(mask, args.nodata_min_area, args.nthreads)
+            n_new = int((large & ~nan_mask).sum())
+            if n_new:
+                print(f"  {n_new:,} zero-valued no-data pixels (regions >= "
+                      f"{args.nodata_min_area} px) will render black")
+            nan_mask |= large
+            large = None
+
     for ch in (B, G, R, L):
         ne.evaluate("where(ch != ch, 0.0, ch)", local_dict={'ch': ch}, out=ch)
 
@@ -497,6 +646,79 @@ def rescale_and_blend(args, parser):
     gc.collect()
 
     return B, G, R, L, wcs, fits_i_path, nan_mask
+
+# ---------------------------------------------------------------------------
+# Edge erosion
+# ---------------------------------------------------------------------------
+
+def apply_edge_margin(nan_mask, margin, nthreads=1):
+    """Grow the no-data mask by `margin` pixels into the valid data, so that
+    pixels within `margin` of a no-data region also render black (ported from
+    mosaic_eummy.py's --edge-margin).
+
+    The "data edge" is the boundary of nan_mask (pixels NaN in all four
+    bands, plus large zero-valued regions if --nodata-min-area is set; see
+    repair_bad_pixels). The image frame itself is NOT treated as an edge --
+    the distance transform only measures distance to no-data pixels inside
+    the array -- so a tile without no-data regions is unchanged. This
+    matches mosaic_eummy.py, where only uncovered regions inside the mosaic
+    bounding box are eroded.
+
+    As in mosaic_eummy.py, the distance transform runs on a binned mask for
+    speed and memory (a full-resolution EDT of a 19200^2 tile would need a
+    ~3 GB float64 array). A binned cell counts as no-data only if ALL its
+    pixels are no-data, equivalent to mosaic_eummy rounding tile footprints
+    outward. The bin factor is reduced for small margins (margin/BIN >= 20
+    binned pixels; BIN=1, i.e. exact, for margin < 40).
+
+    Binning error is one-sided: the masked zone is never wider than
+    `margin`, but can be up to ~3*BIN pixels narrower (partially no-data
+    cells count as data, plus cell-centre vs pixel distance). Measured on a
+    synthetic slanted edge: 3 px short at margin=50 (BIN=2), 29 px short at
+    margin>=300 (BIN=10). mosaic_eummy.py has the same behaviour.
+
+    The full-resolution passes (binning, expansion + OR, counting) run in
+    parallel row stripes over nthreads threads.
+
+    Returns a new boolean mask (nan_mask OR edge zone); nan_mask is unchanged.
+    """
+    if margin <= 0:
+        return nan_mask
+
+    H, W = nan_mask.shape
+    BIN = int(min(10, max(1, margin // 20)))
+
+    # Binned no-data cells; also tells us cheaply whether there is any
+    # no-data at all (a cell is set iff all its pixels are no-data).
+    nodata_b = _bin_reduce(nan_mask, BIN, reduce_all=True, nthreads=nthreads)
+    if not nodata_b.any():
+        # Either no no-data at all, or only regions too small to fill a
+        # single BIN x BIN cell -- the binned distance transform would not
+        # see them anyway (same as mosaic_eummy). Also guards the
+        # no-background case: distance_transform_edt then does not return
+        # infinity but distances to a virtual point just outside the (0, 0)
+        # corner, which would blank a quarter-disc of radius `margin` there.
+        print(f"Edge margin {margin} px: no no-data region at {BIN}x binning — nothing to erode")
+        return nan_mask
+    if nodata_b.all():
+        return nan_mask
+
+    print(f"Edge margin {margin} px: distance transform at {BIN}x binning "
+          f"({nodata_b.shape[1]}×{nodata_b.shape[0]})", flush=True)
+
+    # Distance (in binned pixels) from each data cell to the nearest no-data
+    # cell; no-data cells themselves have distance 0.
+    edge_b = distance_transform_edt(~nodata_b) < (margin / BIN)
+    nodata_b = None
+
+    # Expand to full resolution, OR with the exact original no-data pixels
+    # (binning only treats fully no-data cells as no-data, so partial cells
+    # must not be lost), and count new pixels -- one fused parallel pass.
+    edge_mask, n_new = _expand_combine(edge_b, BIN, nan_mask, 'or', nthreads)
+
+    print(f"  {n_new:,} additional pixels masked "
+          f"({100.0 * n_new / edge_mask.size:.2f}% of image)", flush=True)
+    return edge_mask
 
 # ---------------------------------------------------------------------------
 # Dynamic-range stretch and contrast

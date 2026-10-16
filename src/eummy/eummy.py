@@ -41,7 +41,7 @@ import numexpr as ne
 
 from .eummy_io import parse_arguments, load_cutout_specs
 from .eummy_fluxspace import (rescale_and_blend, _apply_cvd_daltonize,
-                               stretch_and_normalise_channel)
+                               stretch_and_normalise_channel, apply_edge_margin)
 from .eummy_colorspace import process_cutouts, colorise_image
 
 
@@ -52,6 +52,15 @@ def main():
 
     # 1. Photometric rescaling, bad-pixel repair, channel blending
     B, G, R, L, wcs, fits_path, nan_mask = rescale_and_blend(args, parser)
+
+    # 1b. Edge erosion: grow the no-data mask by --edge-margin pixels. Only
+    #     the mask changes (pixel values are untouched); render_lab_pipeline
+    #     zeroes masked pixels at the very end, after unsharp masking, so the
+    #     black zone does not bleed into adjacent data via the UM blur. Done
+    #     on the full image before any cutout cropping, so cutouts near an
+    #     edge get the correct distance to the full image's no-data region.
+    if args.edge_margin > 0:
+        nan_mask = apply_edge_margin(nan_mask, args.edge_margin, args.nthreads)
 
     # 2. CVD daltonization — applied before normalisation, on raw flux
     if args.cvd is not None:

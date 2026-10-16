@@ -124,6 +124,30 @@ def parse_arguments():
     parser.add_argument("--mask", nargs="?", default=None, const=True, type=str2bool,
                         help="Mask hot pixels; auto-applied to EWS images unless set to False")
 
+    # --- No-data detection ---
+    parser.add_argument("--nodata-min-area", nargs="?", type=int, default=0, const=10000,
+                        metavar="PIX",
+                        help="Off by default (only pixels NaN in all four bands are no-data).\n"
+                             "When given, pixels that are zero or NaN in all four bands (any\n"
+                             "mix) are also rendered black as no-data if they form a connected\n"
+                             "region of at least PIX pixels (default PIX 10000 if the flag is\n"
+                             "given without a value). Smaller zero-valued blobs, e.g. saturated\n"
+                             "star cores (~5-20 px across), keep rendering white. Use for the\n"
+                             "rare tiles whose no-data areas are zero-filled instead of NaN.\n"
+                             "Region sizes are estimated on an 8x binned mask and can be\n"
+                             "overestimated (a 20 px core may count as ~1000 px), so keep\n"
+                             "PIX well above that.  Example: --nodata-min-area  or  --nodata-min-area 20000")
+
+    # --- Edge erosion ---
+    parser.add_argument("--edge-margin", type=int, default=0, metavar="PIX",
+                        help="Render pixels within PIX pixels of a no-data region (NaN in all\n"
+                             "four bands) black, removing noisy survey-edge data. The image\n"
+                             "frame itself is not treated as an edge. Same method as\n"
+                             "mosaic_eummy.py --edge-margin. The distance is computed on a\n"
+                             "binned mask, so the zone can be up to ~3x the bin factor narrower\n"
+                             "than PIX (bin <= 10: at most ~30 px narrower), never wider.\n"
+                             "0 disables.")
+
     # --- Colour pipeline ---
     parser.add_argument("--pivot", type=float, default=0.15,
                         help="Asinh pivot parameter, in the same units as --blackwhite -- i.e.\n"
@@ -198,6 +222,11 @@ def parse_arguments():
 
     args = parser.parse_args()
     args.UM = parse_um(args.UM)
+
+    if args.edge_margin < 0:
+        parser.error("--edge-margin must be >= 0")
+    if args.nodata_min_area < 0:
+        parser.error("--nodata-min-area must be >= 0")
 
     # Parse --saturate: one value → same for a* and b*; two values → (sa, sb)
     if len(args.saturate) == 1:
