@@ -12,7 +12,7 @@ Depends on eummy_fluxspace (stretch_and_normalise_channel, contrast_adjustment,
 _crop_channel) and eummy_io (write_output, cutout-spec helpers).
 """
 
-import os, gc, cv2
+import os, gc, time, contextlib, cv2
 import numpy as np
 import numexpr as ne
 import tifffile
@@ -272,6 +272,34 @@ def unsharp_mask(image, radius=1.6, strength=0.75, threshold=0.09,
     ne.evaluate("where(image > hi, hi, where(image < lo, lo, image))",
                 local_dict={'image': image, 'lo': lo, 'hi': hi}, out=image)
 
+@contextlib.contextmanager
+def _exclusive_file_lock(lock_path):
+    """Cross-platform exclusive inter-process lock on lock_path.
+    Uses fcntl.flock on POSIX (Linux, macOS) and msvcrt.locking on Windows."""
+    with open(lock_path, 'a+b') as lf:
+        if os.name == 'nt':
+            import msvcrt
+            lf.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)  # retries ~10 s, then raises
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lf.seek(0)
+                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
+
 def plot_ab_histogram(L_star, a_star, b_star, args):
     """Append per-pixel a* and b* values into shared FITS accumulator files,
     one file per L* luminosity bin, using flock-based locking for safe
@@ -290,7 +318,6 @@ def plot_ab_histogram(L_star, a_star, b_star, args):
     are created on first write.  The caller is responsible for running
     plot_ab_combined.py once all tiles have been processed.
     """
-    import fcntl
     from astropy.io import fits as _fits
     from astropy.table import Table, vstack
 
@@ -313,25 +340,20 @@ def plot_ab_histogram(L_star, a_star, b_star, args):
         fits_path = os.path.join(out_dir, fname)
         lock_path = fits_path + ".lock"
 
-        # Open (or create) the lock file and acquire an exclusive lock.
-        # The lock is held for the entire read-modify-write cycle.
-        with open(lock_path, 'w') as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                new_rows = Table({'A_STAR': a_vals, 'B_STAR': b_vals})
+        # Exclusive lock held for the entire read-modify-write cycle.
+        with _exclusive_file_lock(lock_path):
+            new_rows = Table({'A_STAR': a_vals, 'B_STAR': b_vals})
 
-                if os.path.exists(fits_path):
-                    with _fits.open(fits_path, memmap=False) as hdul:
-                        existing = Table(hdul[1].data)
-                    combined = vstack([existing, new_rows])
-                else:
-                    combined = new_rows
+            if os.path.exists(fits_path):
+                with _fits.open(fits_path, memmap=False) as hdul:
+                    existing = Table(hdul[1].data)
+                combined = vstack([existing, new_rows])
+            else:
+                combined = new_rows
 
-                combined.write(fits_path, format='fits', overwrite=True)
-                print(f"  {fname}: {len(combined):,} rows total "
-                      f"(+{len(new_rows):,} from this tile)")
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+            combined.write(fits_path, format='fits', overwrite=True)
+            print(f"  {fname}: {len(combined):,} rows total "
+                  f"(+{len(new_rows):,} from this tile)")
 
 # ---------------------------------------------------------------------------
 # Cutout rendering

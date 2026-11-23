@@ -194,7 +194,7 @@ def parse_arguments():
 
     # --- Output ---
     parser.add_argument("--output", default="TILE[id].tif", help="Output file name")
-    parser.add_argument("--nthreads", type=int, default=os.cpu_count() // 2,
+    parser.add_argument("--nthreads", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                         help="Number of threads for parallel operations")
 
     # --- Cutouts ---
@@ -484,16 +484,22 @@ def write_output(rgb, wcs, args):
     rgb = None
     gc.collect()
 
-    # Atomically replace the convenience symlink
+    # Atomically replace the convenience symlink. It is not essential (and
+    # symlinks may be unavailable, e.g. Windows without developer mode), so
+    # any failure is silently ignored.
     link_name = os.path.join(args.path, "link.tif")
     tmp_link = link_name + ".tmp"
     try:
+        if os.path.lexists(tmp_link):
+            os.unlink(tmp_link)
         os.symlink(args.output, tmp_link)
         os.replace(tmp_link, link_name)
-    except Exception as e:
-        if os.path.exists(tmp_link):
-            os.unlink(tmp_link)
-        raise
+    except (OSError, NotImplementedError):
+        try:
+            if os.path.lexists(tmp_link):
+                os.unlink(tmp_link)
+        except OSError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Cutout specification parsing (coordinates, dimensions, catalogs)
@@ -698,7 +704,7 @@ def load_cutout_specs(args):
                 print(f"WARNING: --cutouts radius argument '{cutouts_radius}' is ignored for text files")
             specs = []
             try:
-                with open(cutouts_file) as fh:
+                with open(cutouts_file, encoding='utf-8-sig') as fh:
                     for lineno, line in enumerate(fh, 1):
                         line = line.strip()
                         if not line or line.startswith('#'):

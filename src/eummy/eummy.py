@@ -36,6 +36,7 @@ The actual pipeline lives in three modules:
 This file just wires them together.
 """
 
+import sys
 import cv2
 import numexpr as ne
 
@@ -45,7 +46,18 @@ from .eummy_fluxspace import (rescale_and_blend, _apply_cvd_daltonize,
 from .eummy_colorspace import process_cutouts, colorise_image
 
 
+def _make_stdio_safe():
+    """Legacy Windows consoles / redirected output use cp1252 etc., which cannot
+    encode characters such as '≈' or '→' used in messages. Never crash on print."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main():
+    _make_stdio_safe()
     args, parser = parse_arguments()
     ne.set_num_threads(args.nthreads)
     cv2.setNumThreads(args.nthreads)
